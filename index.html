@@ -87,7 +87,7 @@
             recognition = new SpeechRecognition();
             recognition.continuous = true;
             recognition.interimResults = false;
-            recognition.lang = 'en-SG';
+            recognition.lang = 'en-US'; // Switched to US for stronger neural engine
 
             recognition.onstart = () => {
                 if (isAppActive && !isSpeaking) statusEl.innerText = "Listening...";
@@ -136,7 +136,6 @@
             appContent.style.display = 'flex';
             loadVoices();
 
-            // Unlock audio natively
             if ('speechSynthesis' in window) {
                 window.speechSynthesis.resume();
                 const unlock = new SpeechSynthesisUtterance(' ');
@@ -203,16 +202,20 @@
                     }
                 }
             }
-            return bestScore <= 5 ? { card: bestMatch, index: bestIndex } : null;
+            // Increased threshold from 5 to 7 to allow for rougher mispronunciations
+            return bestScore <= 7 ? { card: bestMatch, index: bestIndex } : null;
         }
 
         function processInput(text) {
             if (isSpeaking) return;
 
-            let processedText = text.replace(/\bone\b/g, "1").replace(/\btwo\b/g, "2").replace(/\bthree\b/g, "3")
-                       .replace(/\bfour\b/g, "4").replace(/\bfive\b/g, "5").replace(/\bsix\b/g, "6")
-                       .replace(/\bseven\b/g, "7").replace(/\beight\b/g, "8").replace(/\bnine\b/g, "9")
-                       .replace(/\bten\b/g, "10");
+            // Strip out common conversational filler words that confuse the matching engine
+            let processedText = text.replace(/\b(at|to|number|position|cut|for|the)\b/g, '')
+                                    .replace(/\bone\b/g, "1").replace(/\btwo\b/g, "2").replace(/\bthree\b/g, "3")
+                                    .replace(/\bfour\b/g, "4").replace(/\bfive\b/g, "5").replace(/\bsix\b/g, "6")
+                                    .replace(/\bseven\b/g, "7").replace(/\beight\b/g, "8").replace(/\bnine\b/g, "9")
+                                    .replace(/\bten\b/g, "10")
+                                    .replace(/\s+/g, " ").trim();
 
             const numbers = processedText.match(/\b([1-9]|[1-4][0-9]|5[0-2])\b/g);
             
@@ -252,12 +255,10 @@
             isSpeaking = true;
             statusEl.innerText = "Speaking...";
             
-            // 1. Politely ask the mic to stop to free the channel
             if (recognition) {
                 recognition.stop();
             }
 
-            // 2. Wait 600ms to ensure the mic completely disengages in iOS before pushing audio
             setTimeout(() => {
                 window.speechSynthesis.cancel();
                 
@@ -268,7 +269,6 @@
                 utterance.onend = () => {
                     isSpeaking = false;
                     clearTimeout(speechFailSafeTimeout);
-                    // Wait 500ms after speaking before turning mic back on to prevent overlap
                     setTimeout(startMicSafely, 500);
                 };
 
