@@ -54,7 +54,6 @@
         let selectedVoice = null;
         let voiceUnlocked = false;
         
-        // Voice Activity Detection Variables
         let audioContext = null;
         let mediaRecorder = null;
         let audioStream = null;
@@ -73,7 +72,6 @@
         }
         window.speechSynthesis.onvoiceschanged = loadVoices;
 
-        // Hidden tap to unlock TTS natively
         document.body.addEventListener('touchstart', () => {
             if (!voiceUnlocked) {
                 loadVoices();
@@ -89,7 +87,7 @@
         });
 
         async function startListening() {
-            if (audioStream) return; // Already listening
+            if (audioStream) return; 
 
             try {
                 audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -106,29 +104,43 @@
                 
                 mediaRecorder.onstop = async () => {
                     if (audioChunks.length === 0) return;
-                    const audioBlob = new Blob(audioChunks);
+                    const audioBlob = new Blob(audioChunks, { type: 'audio/mp4' });
                     audioChunks = []; 
                     
                     statusEl.innerText = "Analyzing...";
                     statusEl.style.color = "#ffb86c"; 
                     
-                    const formData = new FormData();
-                    formData.append('file', audioBlob, 'speech.mp4'); 
-                    
-                    try {
-                        const res = await fetch('/api/transcribe', { method: 'POST', body: formData });
-                        const data = await res.json();
+                    // Convert to Base64 to safely bypass Vercel parsing errors
+                    const reader = new FileReader();
+                    reader.readAsDataURL(audioBlob);
+                    reader.onloadend = async () => {
+                        const base64data = reader.result.split(',')[1];
                         
-                        if (data.text) {
-                            debugEl.innerText = `AI Heard: "${data.text}"`;
-                            processInput(data.text);
-                        } else {
+                        try {
+                            const res = await fetch('/api/transcribe', { 
+                                method: 'POST', 
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ audio: base64data })
+                            });
+                            const data = await res.json();
+                            
+                            if (data.error) {
+                                debugEl.innerText = `API Error: ${data.error}`;
+                                resetToListening();
+                                return;
+                            }
+                            
+                            if (data.text) {
+                                debugEl.innerText = `AI Heard: "${data.text}"`;
+                                processInput(data.text);
+                            } else {
+                                resetToListening();
+                            }
+                        } catch (e) {
+                            debugEl.innerText = "Error reaching AI Server.";
                             resetToListening();
                         }
-                    } catch (e) {
-                        debugEl.innerText = "Error reaching AI.";
-                        resetToListening();
-                    }
+                    };
                 };
 
                 resetToListening();
@@ -146,7 +158,6 @@
             }
         }
 
-        // Hard kill the microphone tracks to clear the iOS orange dot
         function stopListening() {
             if (animationFrameId) cancelAnimationFrame(animationFrameId);
             if (mediaRecorder && mediaRecorder.state !== 'inactive') {
