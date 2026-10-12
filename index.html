@@ -3,8 +3,6 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <meta name="apple-mobile-web-app-capable" content="yes">
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <title>ACAAN</title>
     <style>
         body {
@@ -19,19 +17,44 @@
             margin: 0;
             text-align: center;
             overflow: hidden;
+            -webkit-user-select: none;
+            user-select: none;
         }
         h1 { color: #9d84ff; font-size: 2rem; margin-bottom: 10px; }
         #status { font-size: 1.2rem; margin-top: 20px; color: #a0a5b5; }
         #debug { font-size: 0.9rem; margin-top: 10px; color: #555; font-style: italic; min-height: 20px; padding: 0 20px; }
         #result { font-size: 1.5rem; margin-top: 30px; font-weight: bold; color: #ffffff; padding: 20px; border-radius: 10px; background: #232533; display: none; width: 80%; }
+        #audio-unlock-overlay {
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(15, 17, 26, 0.98);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            z-index: 999;
+            cursor: pointer;
+        }
+        #audio-unlock-overlay p {
+            color: #9d84ff;
+            font-size: 1.3rem;
+            margin: 10px 20px;
+        }
     </style>
 </head>
 <body>
 
+    <div id="audio-unlock-overlay">
+        <p>Tap to Connect Audio & Mic</p>
+    </div>
+
     <h1>ACAAN</h1>
-    <div id="status">Starting mic...</div>
-    <div id="debug">Tap screen once to unlock voice</div>
+    <div id="status">Connecting...</div>
+    <div id="debug"></div>
     <div id="result"></div>
+
+    <!-- Hidden audio element for Bluetooth media routing -->
+    <audio id="mediaAudio" playsinline preload="auto"></audio>
 
     <script>
         const stack = [
@@ -43,44 +66,41 @@
             "ace of hearts", "9 of diamonds"
         ];
 
+        const overlay = document.getElementById('audio-unlock-overlay');
         const statusEl = document.getElementById('status');
         const debugEl = document.getElementById('debug');
         const resultEl = document.getElementById('result');
+        const mediaAudio = document.getElementById('mediaAudio');
 
         let recognition;
         let isListening = false;
-        let voiceUnlocked = false;
-        let isSpeaking = false; 
+        let isSpeaking = false;
         let isAppActive = true;
-        
-        window.currentUtterance = null;
         let speechFailSafeTimeout = null;
-        let selectedVoice = null;
-        
+
+        // Initialize Speech Recognition
         if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
             const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
             recognition = new SpeechRecognition();
             recognition.continuous = true;
             recognition.interimResults = false;
-            recognition.lang = 'en-SG'; 
+            recognition.lang = 'en-SG';
 
             recognition.onstart = () => {
                 isListening = true;
-                if (isAppActive) statusEl.innerText = "Listening...";
+                if (isAppActive && !isSpeaking) statusEl.innerText = "Listening...";
             };
 
             recognition.onresult = (event) => {
                 let transcript = event.results[event.results.length - 1][0].transcript.toLowerCase();
                 transcript = transcript.replace(/[.,!?]/g, "").trim();
-                
                 debugEl.innerText = `Heard: "${transcript}"`;
-                
                 processInput(transcript);
             };
 
             recognition.onerror = (event) => {
-                if(event.error !== 'no-speech' && !isSpeaking && isAppActive) {
-                    statusEl.innerText = "Error, restarting mic...";
+                if (event.error !== 'no-speech' && !isSpeaking && isAppActive) {
+                    statusEl.innerText = "Reconnecting mic...";
                 }
             };
 
@@ -89,17 +109,44 @@
                 if (!isSpeaking && isAppActive) {
                     setTimeout(() => {
                         try { recognition.start(); } catch(e) {}
-                    }, 400);
+                    }, 300);
                 }
             };
         } else {
-            statusEl.innerText = "Speech recognition not supported in this browser.";
+            statusEl.innerText = "Speech recognition not supported.";
         }
 
+        // Tap once to unlock both Web Audio (for Bluetooth) and request microphone
+        overlay.addEventListener('click', async () => {
+            overlay.style.display = 'none';
+
+            // 1. Prime the media audio player with a silent sample to unlock Bluetooth routing
+            mediaAudio.src = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA";
+            try {
+                await mediaAudio.play();
+            } catch (e) {}
+
+            // 2. Prime speech synthesis as secondary backup
+            if ('speechSynthesis' in window) {
+                window.speechSynthesis.resume();
+                const unlock = new SpeechSynthesisUtterance(' ');
+                unlock.volume = 0.01;
+                window.speechSynthesis.speak(unlock);
+            }
+
+            // 3. Start recognition
+            if (recognition) {
+                try {
+                    recognition.start();
+                } catch(e) {}
+            }
+        });
+
+        // App backgrounding logic
         document.addEventListener('visibilitychange', () => {
             if (document.hidden) {
                 isAppActive = false;
-                if (recognition) recognition.abort(); 
+                if (recognition) recognition.abort();
             } else {
                 isAppActive = true;
                 if (recognition && !isListening && !isSpeaking) {
@@ -107,41 +154,6 @@
                         try { recognition.start(); } catch(e) {}
                     }, 400);
                 }
-            }
-        });
-
-        window.addEventListener('pagehide', () => {
-            if (recognition) recognition.abort();
-        });
-
-        function loadVoices() {
-            const voices = window.speechSynthesis.getVoices();
-            if (voices.length > 0) {
-                selectedVoice = voices.find(voice => voice.lang.includes('en')) || voices[0];
-            }
-        }
-        
-        window.speechSynthesis.onvoiceschanged = loadVoices;
-
-        document.body.addEventListener('touchstart', () => {
-            if (!voiceUnlocked) {
-                loadVoices();
-                window.speechSynthesis.resume();
-                
-                const unlockUtterance = new SpeechSynthesisUtterance(' ');
-                unlockUtterance.volume = 0.01; 
-                if (selectedVoice) unlockUtterance.voice = selectedVoice;
-                window.speechSynthesis.speak(unlockUtterance);
-                
-                voiceUnlocked = true;
-                debugEl.innerText = "(Voice Unlocked) Listening...";
-            }
-        });
-
-        window.addEventListener('load', () => {
-            loadVoices();
-            if (recognition && !isListening && isAppActive) {
-                try { recognition.start(); } catch(e) {}
             }
         });
 
@@ -163,7 +175,6 @@
             let bestMatch = null;
             let bestScore = Infinity;
             let bestIndex = -1;
-
             const words = text.split(" ");
             
             for (let i = 0; i < stack.length; i++) {
@@ -183,7 +194,6 @@
                 for (let j = 0; j <= words.length - cardWordCount; j++) {
                     const snippet = words.slice(j, j + cardWordCount).join(" ");
                     const distance = getEditDistance(snippet, card);
-                    
                     if (distance < bestScore) {
                         bestScore = distance;
                         bestMatch = card;
@@ -203,18 +213,14 @@
                        .replace(/\bseven\b/g, "7").replace(/\beight\b/g, "8").replace(/\bnine\b/g, "9")
                        .replace(/\bten\b/g, "10");
 
-            // Extract ALL numbers between 1 and 52
             const numbers = processedText.match(/\b([1-9]|[1-4][0-9]|5[0-2])\b/g);
             
             if (numbers && numbers.length > 0) {
-                // Assume the target position is the LAST valid number spoken
                 const targetPositionStr = numbers[numbers.length - 1];
                 const targetPosition = parseInt(targetPositionStr, 10);
                 
-                // Remove only the target position from the text so we can cleanly match the card
                 const lastIndex = processedText.lastIndexOf(targetPositionStr);
                 let textWithoutPosition = processedText;
-                
                 if (lastIndex !== -1) {
                     textWithoutPosition = processedText.substring(0, lastIndex) + processedText.substring(lastIndex + targetPositionStr.length);
                 }
@@ -225,22 +231,18 @@
                     const currentPosition = matchResult.index + 1; 
 
                     let cutAmount = currentPosition - targetPosition;
-                    if (cutAmount < 0) {
-                        cutAmount += 52;
-                    }
-
+                    if (cutAmount < 0) cutAmount += 52;
                     if (cutAmount === 0) return; 
 
                     const bottomCardIndex = (cutAmount - 1 + 52) % 52;
                     const bottomCard = stack[bottomCardIndex];
-
                     const formattedCard = bottomCard.replace(/\b\w/g, c => c.toUpperCase());
                     const outputText = `Cut ${cutAmount} cards (${formattedCard}).`;
 
                     resultEl.innerText = outputText;
                     resultEl.style.display = 'block';
 
-                    speak(outputText);
+                    speakViaMedia(outputText);
                 }
             }
         }
@@ -254,44 +256,53 @@
                 statusEl.innerText = "Listening...";
                 setTimeout(() => {
                     try { recognition.start(); } catch(e) {}
-                }, 400);
+                }, 300);
             }
         }
 
-        function speak(text) {
+        // Plays audio over standard iOS Media Channel (Bluetooth / Earpiece compatible)
+        function speakViaMedia(text) {
             isSpeaking = true;
             statusEl.innerText = "Speaking...";
             
+            // 1. Release microphone focus
             if (recognition) {
-                recognition.abort(); 
+                recognition.abort();
             }
 
-            window.speechSynthesis.cancel();
+            // 2. Encode text for speech stream
+            const cleanText = text.replace(/[()]/g, '');
+            const audioUrl = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(cleanText)}&tl=en&client=tw-ob`;
+
+            mediaAudio.src = audioUrl;
+
+            mediaAudio.onended = () => {
+                finishSpeakingAndRestartMic();
+            };
+
+            mediaAudio.onerror = () => {
+                // If network audio fails, fall back to native speech
+                if ('speechSynthesis' in window) {
+                    const fallback = new SpeechSynthesisUtterance(text);
+                    fallback.rate = 1.0;
+                    fallback.onend = finishSpeakingAndRestartMic;
+                    fallback.onerror = finishSpeakingAndRestartMic;
+                    window.speechSynthesis.speak(fallback);
+                } else {
+                    finishSpeakingAndRestartMic();
+                }
+            };
 
             setTimeout(() => {
-                window.currentUtterance = new SpeechSynthesisUtterance(text);
-                window.currentUtterance.rate = 1.0;
-                window.currentUtterance.volume = 1.0;
-                
-                if (selectedVoice) {
-                    window.currentUtterance.voice = selectedVoice;
-                }
-
-                window.currentUtterance.onend = () => {
+                mediaAudio.play().catch(() => {
                     finishSpeakingAndRestartMic();
-                };
+                });
+            }, 300);
 
-                window.currentUtterance.onerror = (e) => {
-                    finishSpeakingAndRestartMic();
-                };
-
-                window.speechSynthesis.speak(window.currentUtterance);
-
-                speechFailSafeTimeout = setTimeout(() => {
-                    finishSpeakingAndRestartMic();
-                }, 4000);
-                
-            }, 400); 
+            // Fail-safe to prevent lockup
+            speechFailSafeTimeout = setTimeout(() => {
+                finishSpeakingAndRestartMic();
+            }, 5000);
         }
     </script>
 </body>
