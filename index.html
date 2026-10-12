@@ -22,6 +22,7 @@
         }
         h1 { color: #9d84ff; font-size: 2rem; margin-bottom: 10px; }
         #status { font-size: 1.2rem; margin-top: 20px; color: #a0a5b5; }
+        #debug { font-size: 0.9rem; margin-top: 10px; color: #555; font-style: italic; min-height: 20px; }
         #result { font-size: 1.5rem; margin-top: 30px; font-weight: bold; color: #ffffff; padding: 20px; border-radius: 10px; background: #232533; display: none; width: 80%; }
         
         /* Full screen overlay to unlock audio */
@@ -45,6 +46,7 @@
 
     <h1>ACAAN</h1>
     <div id="status">Waiting to start...</div>
+    <div id="debug"></div>
     <div id="result"></div>
 
     <script>
@@ -59,9 +61,11 @@
 
         const startOverlay = document.getElementById('start-overlay');
         const statusEl = document.getElementById('status');
+        const debugEl = document.getElementById('debug');
         const resultEl = document.getElementById('result');
 
         let recognition;
+        let isListening = false;
         
         // Initialize Speech Recognition
         if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
@@ -71,19 +75,36 @@
             recognition.interimResults = false;
             recognition.lang = 'en-US';
 
+            recognition.onstart = () => {
+                isListening = true;
+                statusEl.innerText = "Listening...";
+            };
+
             recognition.onresult = (event) => {
-                const transcript = event.results[event.results.length - 1][0].transcript.toLowerCase();
+                // Get transcript and clean out punctuation that iOS might add
+                let transcript = event.results[event.results.length - 1][0].transcript.toLowerCase();
+                transcript = transcript.replace(/[.,!?]/g, "").trim();
+                
+                // Show what was heard for debugging
+                debugEl.innerText = `Heard: "${transcript}"`;
+                
                 processInput(transcript);
             };
 
             recognition.onerror = (event) => {
                 if(event.error !== 'no-speech') {
-                    statusEl.innerText = "Listening error. Restarting...";
+                    statusEl.innerText = "Error, restarting mic...";
                 }
             };
 
             recognition.onend = () => {
-                recognition.start(); // Keep listening forever
+                isListening = false;
+                // iOS workaround: slight delay before restarting to prevent crash
+                setTimeout(() => {
+                    try {
+                        recognition.start();
+                    } catch(e) {}
+                }, 400);
             };
         } else {
             statusEl.innerText = "Speech recognition not supported in this browser.";
@@ -96,10 +117,12 @@
             window.speechSynthesis.speak(unlockUtterance);
 
             startOverlay.style.display = 'none';
-            statusEl.innerText = "Listening...";
+            statusEl.innerText = "Starting mic...";
             
-            if (recognition) {
-                recognition.start();
+            if (recognition && !isListening) {
+                try {
+                    recognition.start();
+                } catch(e) {}
             }
         });
 
@@ -128,7 +151,6 @@
                     cutAmount += 52;
                 }
 
-                // If cutAmount is 0, no cut is needed
                 if (cutAmount === 0) {
                     return; 
                 }
@@ -148,7 +170,7 @@
         }
 
         function speak(text) {
-            window.speechSynthesis.cancel(); // Stop any current speech
+            window.speechSynthesis.cancel(); 
             const utterance = new SpeechSynthesisUtterance(text);
             utterance.rate = 1.0;
             window.speechSynthesis.speak(utterance);
