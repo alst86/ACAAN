@@ -52,9 +52,9 @@
         let voiceUnlocked = false;
         let isSpeaking = false; 
         
-        // Global variables to prevent aggressive iOS garbage collection
         window.currentUtterance = null;
         let speechFailSafeTimeout = null;
+        let selectedVoice = null;
         
         if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
             const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -95,15 +95,24 @@
             statusEl.innerText = "Speech recognition not supported in this browser.";
         }
 
-        // Pre-load voices on tap
+        // Force load voices to memory
+        function loadVoices() {
+            const voices = window.speechSynthesis.getVoices();
+            if (voices.length > 0) {
+                selectedVoice = voices.find(voice => voice.lang.includes('en')) || voices[0];
+            }
+        }
+        
+        window.speechSynthesis.onvoiceschanged = loadVoices;
+
         document.body.addEventListener('touchstart', () => {
             if (!voiceUnlocked) {
-                window.speechSynthesis.getVoices(); // Force load voices
+                loadVoices();
                 window.speechSynthesis.resume();
                 
-                // Play a brief, barely audible sound to lock in the audio context
                 const unlockUtterance = new SpeechSynthesisUtterance(' ');
                 unlockUtterance.volume = 0.01; 
+                if (selectedVoice) unlockUtterance.voice = selectedVoice;
                 window.speechSynthesis.speak(unlockUtterance);
                 
                 voiceUnlocked = true;
@@ -112,6 +121,7 @@
         });
 
         window.addEventListener('load', () => {
+            loadVoices();
             if (recognition && !isListening) {
                 try { recognition.start(); } catch(e) {}
             }
@@ -168,7 +178,7 @@
         }
 
         function processInput(text) {
-            if (isSpeaking) return; // Prevent overlapping triggers
+            if (isSpeaking) return;
 
             text = text.replace(/\bone\b/g, "1").replace(/\btwo\b/g, "2").replace(/\bthree\b/g, "3")
                        .replace(/\bfour\b/g, "4").replace(/\bfive\b/g, "5").replace(/\bsix\b/g, "6")
@@ -202,7 +212,6 @@
             }
         }
 
-        // Function called when speech ends OR when the fail-safe timer triggers
         function finishSpeakingAndRestartMic() {
             if (!isSpeaking) return;
             isSpeaking = false;
@@ -211,7 +220,7 @@
             statusEl.innerText = "Listening...";
             setTimeout(() => {
                 try { recognition.start(); } catch(e) {}
-            }, 300);
+            }, 400);
         }
 
         function speak(text) {
@@ -219,14 +228,20 @@
             statusEl.innerText = "Speaking...";
             
             if (recognition) {
-                recognition.abort(); // Immediately kill mic to free the audio channel for speech
+                recognition.abort(); 
             }
 
-            // Small delay to ensure mic completely released the audio session
+            window.speechSynthesis.cancel();
+
             setTimeout(() => {
                 window.currentUtterance = new SpeechSynthesisUtterance(text);
                 window.currentUtterance.rate = 1.0;
                 window.currentUtterance.volume = 1.0;
+                
+                // Explicitly assign the loaded voice
+                if (selectedVoice) {
+                    window.currentUtterance.voice = selectedVoice;
+                }
 
                 window.currentUtterance.onend = () => {
                     finishSpeakingAndRestartMic();
@@ -238,12 +253,11 @@
 
                 window.speechSynthesis.speak(window.currentUtterance);
 
-                // FAIL-SAFE: If iOS drops the event, force reset after 4 seconds
                 speechFailSafeTimeout = setTimeout(() => {
                     finishSpeakingAndRestartMic();
                 }, 4000);
                 
-            }, 300);
+            }, 400); // Slightly longer delay to fully release the mic channel
         }
     </script>
 </body>
