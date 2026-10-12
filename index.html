@@ -21,42 +21,18 @@
             user-select: none;
         }
         h1 { color: #9d84ff; font-size: 2rem; margin-bottom: 10px; }
-        #status { font-size: 1.2rem; margin-top: 20px; color: #a0a5b5; }
+        #status { font-size: 1.2rem; margin-top: 20px; color: #a0a5b5; transition: color 0.3s; }
         #debug { font-size: 0.9rem; margin-top: 10px; color: #555; font-style: italic; min-height: 20px; padding: 0 20px; }
         #result { font-size: 1.5rem; margin-top: 30px; font-weight: bold; color: #ffffff; padding: 20px; border-radius: 10px; background: #232533; display: none; width: 80%; }
-        
-        #start-btn {
-            background-color: #9d84ff;
-            color: #0f111a;
-            font-size: 1.5rem;
-            font-weight: bold;
-            padding: 20px 40px;
-            border: none;
-            border-radius: 50px;
-            cursor: pointer;
-            margin-top: 30px;
-            box-shadow: 0 4px 15px rgba(157, 132, 255, 0.4);
-        }
-        #start-btn:active {
-            transform: scale(0.95);
-        }
-        
-        #app-content {
-            display: none;
-            flex-direction: column;
-            align-items: center;
-            width: 100%;
-        }
+        #app-content { display: flex; flex-direction: column; align-items: center; width: 100%; }
     </style>
 </head>
 <body>
 
-    <button id="start-btn">TAP TO START</button>
-
     <div id="app-content">
         <h1>ACAAN</h1>
-        <div id="status">Starting mic...</div>
-        <div id="debug"></div>
+        <div id="status">Initializing...</div>
+        <div id="debug">Tap anywhere to unlock voice</div>
         <div id="result"></div>
     </div>
 
@@ -70,59 +46,25 @@
             "ace of hearts", "9 of diamonds"
         ];
 
-        const startBtn = document.getElementById('start-btn');
-        const appContent = document.getElementById('app-content');
         const statusEl = document.getElementById('status');
         const debugEl = document.getElementById('debug');
         const resultEl = document.getElementById('result');
 
-        let recognition;
         let isSpeaking = false;
-        let isAppActive = true;
         let selectedVoice = null;
-        let speechFailSafeTimeout = null;
-
-        if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
-            const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-            recognition = new SpeechRecognition();
-            recognition.continuous = true;
-            recognition.interimResults = false;
-            recognition.lang = 'en-US'; // Switched to US for stronger neural engine
-
-            recognition.onstart = () => {
-                if (isAppActive && !isSpeaking) statusEl.innerText = "Listening...";
-            };
-
-            recognition.onresult = (event) => {
-                let transcript = event.results[event.results.length - 1][0].transcript.toLowerCase();
-                transcript = transcript.replace(/[.,!?]/g, "").trim();
-                debugEl.innerText = `Heard: "${transcript}"`;
-                processInput(transcript);
-            };
-
-            recognition.onerror = (event) => {
-                if (event.error !== 'no-speech' && !isSpeaking && isAppActive) {
-                    statusEl.innerText = "Reconnecting mic...";
-                }
-            };
-
-            recognition.onend = () => {
-                if (!isSpeaking && isAppActive) {
-                    setTimeout(startMicSafely, 300);
-                }
-            };
-        } else {
-            statusEl.innerText = "Speech recognition not supported.";
-        }
-
-        function startMicSafely() {
-            if (!isSpeaking && isAppActive && recognition) {
-                try {
-                    recognition.start();
-                } catch(e) {}
-            }
-        }
-
+        let voiceUnlocked = false;
+        
+        // Voice Activity Detection Variables
+        let audioContext = null;
+        let mediaRecorder = null;
+        let audioStream = null;
+        let audioChunks = [];
+        let isRecording = false;
+        let silenceTimer = null;
+        let analyser = null;
+        let dataArray = null;
+        let animationFrameId = null;
+        
         function loadVoices() {
             const voices = window.speechSynthesis.getVoices();
             if (voices.length > 0) {
@@ -131,32 +73,144 @@
         }
         window.speechSynthesis.onvoiceschanged = loadVoices;
 
-        startBtn.addEventListener('click', () => {
-            startBtn.style.display = 'none';
-            appContent.style.display = 'flex';
-            loadVoices();
-
-            if ('speechSynthesis' in window) {
-                window.speechSynthesis.resume();
-                const unlock = new SpeechSynthesisUtterance(' ');
-                unlock.volume = 0.01;
-                window.speechSynthesis.speak(unlock);
+        // Hidden tap to unlock TTS natively
+        document.body.addEventListener('touchstart', () => {
+            if (!voiceUnlocked) {
+                loadVoices();
+                if ('speechSynthesis' in window) {
+                    window.speechSynthesis.resume();
+                    const unlock = new SpeechSynthesisUtterance(' ');
+                    unlock.volume = 0.01;
+                    window.speechSynthesis.speak(unlock);
+                }
+                voiceUnlocked = true;
+                debugEl.innerText = "";
             }
-
-            setTimeout(startMicSafely, 200);
         });
+
+        async function startListening() {
+            if (audioStream) return; // Already listening
+
+            try {
+                audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                const source = audioContext.createMediaStreamSource(audioStream);
+                analyser = audioContext.createAnalyser();
+                analyser.fftSize = 512;
+                source.connect(analyser);
+                dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+                mediaRecorder = new MediaRecorder(audioStream);
+                mediaRecorder.ondataavailable = e => { if (e.data.size > 0) audioChunks.push(e.data); };
+                
+                mediaRecorder.onstop = async () => {
+                    if (audioChunks.length === 0) return;
+                    const audioBlob = new Blob(audioChunks);
+                    audioChunks = []; 
+                    
+                    statusEl.innerText = "Analyzing...";
+                    statusEl.style.color = "#ffb86c"; 
+                    
+                    const formData = new FormData();
+                    formData.append('file', audioBlob, 'speech.mp4'); 
+                    
+                    try {
+                        const res = await fetch('/api/transcribe', { method: 'POST', body: formData });
+                        const data = await res.json();
+                        
+                        if (data.text) {
+                            debugEl.innerText = `AI Heard: "${data.text}"`;
+                            processInput(data.text);
+                        } else {
+                            resetToListening();
+                        }
+                    } catch (e) {
+                        debugEl.innerText = "Error reaching AI.";
+                        resetToListening();
+                    }
+                };
+
+                resetToListening();
+                monitorAudioLevel();
+
+            } catch (err) {
+                statusEl.innerText = "Mic Permission Denied.";
+            }
+        }
+
+        function resetToListening() {
+            if (!isSpeaking) {
+                statusEl.innerText = "Listening...";
+                statusEl.style.color = "#a0a5b5";
+            }
+        }
+
+        // Hard kill the microphone tracks to clear the iOS orange dot
+        function stopListening() {
+            if (animationFrameId) cancelAnimationFrame(animationFrameId);
+            if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                mediaRecorder.stop();
+            }
+            if (audioStream) {
+                audioStream.getTracks().forEach(track => track.stop());
+                audioStream = null;
+            }
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+            clearTimeout(silenceTimer);
+            isRecording = false;
+            statusEl.innerText = "Paused...";
+        }
+
+        window.addEventListener('load', startListening);
 
         document.addEventListener('visibilitychange', () => {
             if (document.hidden) {
-                isAppActive = false;
-                if (recognition) recognition.stop();
+                stopListening();
             } else {
-                isAppActive = true;
-                if (!isSpeaking) {
-                    setTimeout(startMicSafely, 400);
-                }
+                startListening();
             }
         });
+
+        function monitorAudioLevel() {
+            if (!analyser || !audioStream) return;
+            if (isSpeaking) {
+                animationFrameId = requestAnimationFrame(monitorAudioLevel);
+                return;
+            }
+
+            analyser.getByteFrequencyData(dataArray);
+            let sum = 0;
+            for(let i = 0; i < dataArray.length; i++) {
+                sum += dataArray[i];
+            }
+            let average = sum / dataArray.length;
+
+            const SPEECH_THRESHOLD = 15; 
+
+            if (average > SPEECH_THRESHOLD) {
+                if (!isRecording && mediaRecorder && mediaRecorder.state === 'inactive') {
+                    isRecording = true;
+                    mediaRecorder.start();
+                    statusEl.innerText = "Recording...";
+                    statusEl.style.color = "#ff5555"; 
+                }
+                
+                clearTimeout(silenceTimer);
+                
+                silenceTimer = setTimeout(() => {
+                    if (isRecording && mediaRecorder && mediaRecorder.state !== 'inactive') {
+                        isRecording = false;
+                        mediaRecorder.stop(); 
+                    }
+                }, 1200); 
+            }
+            
+            animationFrameId = requestAnimationFrame(monitorAudioLevel);
+        }
 
         function getEditDistance(a, b) {
             if (a.length === 0) return b.length;
@@ -202,14 +256,10 @@
                     }
                 }
             }
-            // Increased threshold from 5 to 7 to allow for rougher mispronunciations
             return bestScore <= 7 ? { card: bestMatch, index: bestIndex } : null;
         }
 
         function processInput(text) {
-            if (isSpeaking) return;
-
-            // Strip out common conversational filler words that confuse the matching engine
             let processedText = text.replace(/\b(at|to|number|position|cut|for|the)\b/g, '')
                                     .replace(/\bone\b/g, "1").replace(/\btwo\b/g, "2").replace(/\bthree\b/g, "3")
                                     .replace(/\bfour\b/g, "4").replace(/\bfive\b/g, "5").replace(/\bsix\b/g, "6")
@@ -236,7 +286,10 @@
 
                     let cutAmount = currentPosition - targetPosition;
                     if (cutAmount < 0) cutAmount += 52;
-                    if (cutAmount === 0) return; 
+                    if (cutAmount === 0) {
+                        resetToListening();
+                        return; 
+                    }
 
                     const bottomCardIndex = (cutAmount - 1 + 52) % 52;
                     const bottomCard = stack[bottomCardIndex];
@@ -248,17 +301,16 @@
 
                     speakResult(outputText);
                 }
+            } else {
+                resetToListening();
             }
         }
 
         function speakResult(text) {
             isSpeaking = true;
             statusEl.innerText = "Speaking...";
+            statusEl.style.color = "#9d84ff"; 
             
-            if (recognition) {
-                recognition.stop();
-            }
-
             setTimeout(() => {
                 window.speechSynthesis.cancel();
                 
@@ -268,24 +320,16 @@
 
                 utterance.onend = () => {
                     isSpeaking = false;
-                    clearTimeout(speechFailSafeTimeout);
-                    setTimeout(startMicSafely, 500);
+                    resetToListening();
                 };
 
                 utterance.onerror = () => {
                     isSpeaking = false;
-                    clearTimeout(speechFailSafeTimeout);
-                    setTimeout(startMicSafely, 500);
+                    resetToListening();
                 };
 
                 window.speechSynthesis.speak(utterance);
-
-                speechFailSafeTimeout = setTimeout(() => {
-                    isSpeaking = false;
-                    startMicSafely();
-                }, 5000);
-
-            }, 600);
+            }, 200);
         }
     </script>
 </body>
