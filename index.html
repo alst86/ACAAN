@@ -67,7 +67,6 @@
         let recognition;
         let isListening = false;
         
-        // Initialize Speech Recognition
         if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
             const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
             recognition = new SpeechRecognition();
@@ -81,11 +80,9 @@
             };
 
             recognition.onresult = (event) => {
-                // Get transcript and clean out punctuation that iOS might add
                 let transcript = event.results[event.results.length - 1][0].transcript.toLowerCase();
                 transcript = transcript.replace(/[.,!?]/g, "").trim();
                 
-                // Show what was heard for debugging
                 debugEl.innerText = `Heard: "${transcript}"`;
                 
                 processInput(transcript);
@@ -99,20 +96,15 @@
 
             recognition.onend = () => {
                 isListening = false;
-                // iOS workaround: slight delay before restarting to prevent crash
                 setTimeout(() => {
-                    try {
-                        recognition.start();
-                    } catch(e) {}
+                    try { recognition.start(); } catch(e) {}
                 }, 400);
             };
         } else {
             statusEl.innerText = "Speech recognition not supported in this browser.";
         }
 
-        // Tap to unlock audio and start listening
         startOverlay.addEventListener('click', () => {
-            // Play silent audio to unlock TTS on iOS/Android
             const unlockUtterance = new SpeechSynthesisUtterance('');
             window.speechSynthesis.speak(unlockUtterance);
 
@@ -120,13 +112,23 @@
             statusEl.innerText = "Starting mic...";
             
             if (recognition && !isListening) {
-                try {
-                    recognition.start();
-                } catch(e) {}
+                try { recognition.start(); } catch(e) {}
             }
         });
 
         function processInput(text) {
+            // Convert written numbers to digits so they match the stack array
+            text = text.replace(/\bone\b/g, "1")
+                       .replace(/\btwo\b/g, "2")
+                       .replace(/\bthree\b/g, "3")
+                       .replace(/\bfour\b/g, "4")
+                       .replace(/\bfive\b/g, "5")
+                       .replace(/\bsix\b/g, "6")
+                       .replace(/\bseven\b/g, "7")
+                       .replace(/\beight\b/g, "8")
+                       .replace(/\bnine\b/g, "9")
+                       .replace(/\bten\b/g, "10");
+
             let foundCard = null;
             let cardIndex = -1;
 
@@ -139,7 +141,7 @@
                 }
             }
 
-            // Find the spoken number (1-52)
+            // Find the spoken position (1-52)
             const numberMatch = text.match(/\b([1-9]|[1-4][0-9]|5[0-2])\b/);
             
             if (foundCard && numberMatch) {
