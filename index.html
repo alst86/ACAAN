@@ -30,7 +30,7 @@
 
     <h1>ACAAN</h1>
     <div id="status">Starting mic...</div>
-    <div id="debug"></div>
+    <div id="debug">Tap screen once to unlock voice</div>
     <div id="result"></div>
 
     <script>
@@ -88,16 +88,20 @@
             statusEl.innerText = "Speech recognition not supported in this browser.";
         }
 
-        // Hidden unlocker: Tap anywhere on the app to ensure the voice works
+        // Robust iOS Voice Unlocker
         document.body.addEventListener('touchstart', () => {
             if (!voiceUnlocked) {
+                // Resume audio context and play a silent utterance
+                window.speechSynthesis.resume();
                 const unlockUtterance = new SpeechSynthesisUtterance('');
+                unlockUtterance.volume = 0; // silent
                 window.speechSynthesis.speak(unlockUtterance);
+                
                 voiceUnlocked = true;
+                debugEl.innerText = "(Voice Unlocked) Listening...";
             }
         });
 
-        // Start listening immediately when the page loads
         window.addEventListener('load', () => {
             if (recognition && !isListening) {
                 try { recognition.start(); } catch(e) {}
@@ -105,7 +109,6 @@
         });
 
         function processInput(text) {
-            // Convert written numbers to digits so they match the stack array
             text = text.replace(/\bone\b/g, "1")
                        .replace(/\btwo\b/g, "2")
                        .replace(/\bthree\b/g, "3")
@@ -120,7 +123,6 @@
             let foundCard = null;
             let cardIndex = -1;
 
-            // Find which card was spoken
             for (let i = 0; i < stack.length; i++) {
                 if (text.includes(stack[i])) {
                     foundCard = stack[i];
@@ -129,7 +131,6 @@
                 }
             }
 
-            // Find the spoken position (1-52)
             const numberMatch = text.match(/\b([1-9]|[1-4][0-9]|5[0-2])\b/);
             
             if (foundCard && numberMatch) {
@@ -145,7 +146,6 @@
                     return; 
                 }
 
-                // Identify the card that will be at the bottom after the cut
                 const bottomCardIndex = (cutAmount - 1 + 52) % 52;
                 const bottomCard = stack[bottomCardIndex];
 
@@ -163,6 +163,7 @@
             window.speechSynthesis.cancel(); 
             const utterance = new SpeechSynthesisUtterance(text);
             utterance.rate = 1.0;
+            utterance.volume = 1.0;
             window.speechSynthesis.speak(utterance);
         }
     </script>
