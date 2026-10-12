@@ -52,6 +52,10 @@
         let voiceUnlocked = false;
         let isSpeaking = false; 
         
+        // Global variables to prevent aggressive iOS garbage collection
+        window.currentUtterance = null;
+        let speechFailSafeTimeout = null;
+        
         if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
             const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
             recognition = new SpeechRecognition();
@@ -74,7 +78,7 @@
             };
 
             recognition.onerror = (event) => {
-                if(event.error !== 'no-speech') {
+                if(event.error !== 'no-speech' && !isSpeaking) {
                     statusEl.innerText = "Error, restarting mic...";
                 }
             };
@@ -91,11 +95,15 @@
             statusEl.innerText = "Speech recognition not supported in this browser.";
         }
 
+        // Pre-load voices on tap
         document.body.addEventListener('touchstart', () => {
             if (!voiceUnlocked) {
+                window.speechSynthesis.getVoices(); // Force load voices
                 window.speechSynthesis.resume();
-                const unlockUtterance = new SpeechSynthesisUtterance('');
-                unlockUtterance.volume = 0; 
+                
+                // Play a brief, barely audible sound to lock in the audio context
+                const unlockUtterance = new SpeechSynthesisUtterance(' ');
+                unlockUtterance.volume = 0.01; 
                 window.speechSynthesis.speak(unlockUtterance);
                 
                 voiceUnlocked = true;
@@ -109,7 +117,6 @@
             }
         });
 
-        // Levenshtein distance algorithm for fuzzy matching strings
         function getEditDistance(a, b) {
             if (a.length === 0) return b.length;
             if (b.length === 0) return a.length;
@@ -129,14 +136,12 @@
             let bestScore = Infinity;
             let bestIndex = -1;
 
-            // Generate "sliding windows" of the transcript to match against card names
             const words = text.split(" ");
             
             for (let i = 0; i < stack.length; i++) {
                 const card = stack[i];
                 const cardWordCount = card.split(" ").length;
                 
-                // If the transcript is shorter than the card name, compare directly
                 if (words.length <= cardWordCount) {
                     const distance = getEditDistance(text, card);
                     if (distance < bestScore) {
@@ -147,7 +152,6 @@
                     continue;
                 }
 
-                // Otherwise, slide through the transcript words to find the closest match phrase
                 for (let j = 0; j <= words.length - cardWordCount; j++) {
                     const snippet = words.slice(j, j + cardWordCount).join(" ");
                     const distance = getEditDistance(snippet, card);
@@ -160,11 +164,12 @@
                 }
             }
 
-            // Threshold: if the distance is too high (e.g., > 5), it's probably just random noise, not a card.
             return bestScore <= 5 ? { card: bestMatch, index: bestIndex } : null;
         }
 
         function processInput(text) {
+            if (isSpeaking) return; // Prevent overlapping triggers
+
             text = text.replace(/\bone\b/g, "1").replace(/\btwo\b/g, "2").replace(/\bthree\b/g, "3")
                        .replace(/\bfour\b/g, "4").replace(/\bfive\b/g, "5").replace(/\bsix\b/g, "6")
                        .replace(/\bseven\b/g, "7").replace(/\beight\b/g, "8").replace(/\bnine\b/g, "9")
@@ -197,36 +202,47 @@
             }
         }
 
+        // Function called when speech ends OR when the fail-safe timer triggers
+        function finishSpeakingAndRestartMic() {
+            if (!isSpeaking) return;
+            isSpeaking = false;
+            clearTimeout(speechFailSafeTimeout);
+            
+            statusEl.innerText = "Listening...";
+            setTimeout(() => {
+                try { recognition.start(); } catch(e) {}
+            }, 300);
+        }
+
         function speak(text) {
             isSpeaking = true;
             statusEl.innerText = "Speaking...";
             
             if (recognition) {
-                recognition.abort();
+                recognition.abort(); // Immediately kill mic to free the audio channel for speech
             }
 
-            window.speechSynthesis.cancel(); 
-            const utterance = new SpeechSynthesisUtterance(text);
-            utterance.rate = 1.0;
-            utterance.volume = 1.0;
-
-            utterance.onend = () => {
-                isSpeaking = false;
-                statusEl.innerText = "Listening...";
-                setTimeout(() => {
-                    try { recognition.start(); } catch(e) {}
-                }, 300);
-            };
-
-            utterance.onerror = () => {
-                isSpeaking = false;
-                setTimeout(() => {
-                    try { recognition.start(); } catch(e) {}
-                }, 300);
-            };
-
+            // Small delay to ensure mic completely released the audio session
             setTimeout(() => {
-                window.speechSynthesis.speak(utterance);
+                window.currentUtterance = new SpeechSynthesisUtterance(text);
+                window.currentUtterance.rate = 1.0;
+                window.currentUtterance.volume = 1.0;
+
+                window.currentUtterance.onend = () => {
+                    finishSpeakingAndRestartMic();
+                };
+
+                window.currentUtterance.onerror = (e) => {
+                    finishSpeakingAndRestartMic();
+                };
+
+                window.speechSynthesis.speak(window.currentUtterance);
+
+                // FAIL-SAFE: If iOS drops the event, force reset after 4 seconds
+                speechFailSafeTimeout = setTimeout(() => {
+                    finishSpeakingAndRestartMic();
+                }, 4000);
+                
             }, 300);
         }
     </script>
