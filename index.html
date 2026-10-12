@@ -62,7 +62,7 @@
             recognition = new SpeechRecognition();
             recognition.continuous = true;
             recognition.interimResults = false;
-            recognition.lang = 'en-SG'; // Set specifically to English (Singapore)
+            recognition.lang = 'en-SG'; 
 
             recognition.onstart = () => {
                 isListening = true;
@@ -96,11 +96,10 @@
             statusEl.innerText = "Speech recognition not supported in this browser.";
         }
 
-        // --- App Lifecycle Management (Turn mic off when closed/backgrounded) ---
         document.addEventListener('visibilitychange', () => {
             if (document.hidden) {
                 isAppActive = false;
-                if (recognition) recognition.abort(); // Kill mic immediately
+                if (recognition) recognition.abort(); 
             } else {
                 isAppActive = true;
                 if (recognition && !isListening && !isSpeaking) {
@@ -114,7 +113,6 @@
         window.addEventListener('pagehide', () => {
             if (recognition) recognition.abort();
         });
-        // ------------------------------------------------------------------------
 
         function loadVoices() {
             const voices = window.speechSynthesis.getVoices();
@@ -200,35 +198,50 @@
         function processInput(text) {
             if (isSpeaking) return;
 
-            text = text.replace(/\bone\b/g, "1").replace(/\btwo\b/g, "2").replace(/\bthree\b/g, "3")
+            let processedText = text.replace(/\bone\b/g, "1").replace(/\btwo\b/g, "2").replace(/\bthree\b/g, "3")
                        .replace(/\bfour\b/g, "4").replace(/\bfive\b/g, "5").replace(/\bsix\b/g, "6")
                        .replace(/\bseven\b/g, "7").replace(/\beight\b/g, "8").replace(/\bnine\b/g, "9")
                        .replace(/\bten\b/g, "10");
 
-            const matchResult = findBestCardMatch(text);
-            const numberMatch = text.match(/\b([1-9]|[1-4][0-9]|5[0-2])\b/);
+            // Extract ALL numbers between 1 and 52
+            const numbers = processedText.match(/\b([1-9]|[1-4][0-9]|5[0-2])\b/g);
             
-            if (matchResult && numberMatch) {
-                const targetPosition = parseInt(numberMatch[1], 10);
-                const currentPosition = matchResult.index + 1; 
-
-                let cutAmount = currentPosition - targetPosition;
-                if (cutAmount < 0) {
-                    cutAmount += 52;
+            if (numbers && numbers.length > 0) {
+                // Assume the target position is the LAST valid number spoken
+                const targetPositionStr = numbers[numbers.length - 1];
+                const targetPosition = parseInt(targetPositionStr, 10);
+                
+                // Remove only the target position from the text so we can cleanly match the card
+                const lastIndex = processedText.lastIndexOf(targetPositionStr);
+                let textWithoutPosition = processedText;
+                
+                if (lastIndex !== -1) {
+                    textWithoutPosition = processedText.substring(0, lastIndex) + processedText.substring(lastIndex + targetPositionStr.length);
                 }
 
-                if (cutAmount === 0) return; 
+                const matchResult = findBestCardMatch(textWithoutPosition.trim());
+                
+                if (matchResult) {
+                    const currentPosition = matchResult.index + 1; 
 
-                const bottomCardIndex = (cutAmount - 1 + 52) % 52;
-                const bottomCard = stack[bottomCardIndex];
+                    let cutAmount = currentPosition - targetPosition;
+                    if (cutAmount < 0) {
+                        cutAmount += 52;
+                    }
 
-                const formattedCard = bottomCard.replace(/\b\w/g, c => c.toUpperCase());
-                const outputText = `Cut ${cutAmount} cards (${formattedCard}).`;
+                    if (cutAmount === 0) return; 
 
-                resultEl.innerText = outputText;
-                resultEl.style.display = 'block';
+                    const bottomCardIndex = (cutAmount - 1 + 52) % 52;
+                    const bottomCard = stack[bottomCardIndex];
 
-                speak(outputText);
+                    const formattedCard = bottomCard.replace(/\b\w/g, c => c.toUpperCase());
+                    const outputText = `Cut ${cutAmount} cards (${formattedCard}).`;
+
+                    resultEl.innerText = outputText;
+                    resultEl.style.display = 'block';
+
+                    speak(outputText);
+                }
             }
         }
 
