@@ -24,37 +24,41 @@
         #status { font-size: 1.2rem; margin-top: 20px; color: #a0a5b5; }
         #debug { font-size: 0.9rem; margin-top: 10px; color: #555; font-style: italic; min-height: 20px; padding: 0 20px; }
         #result { font-size: 1.5rem; margin-top: 30px; font-weight: bold; color: #ffffff; padding: 20px; border-radius: 10px; background: #232533; display: none; width: 80%; }
-        #audio-unlock-overlay {
-            position: absolute;
-            top: 0; left: 0; width: 100%; height: 100%;
-            background: rgba(15, 17, 26, 0.98);
-            display: flex;
+        
+        #start-btn {
+            background-color: #9d84ff;
+            color: #0f111a;
+            font-size: 1.5rem;
+            font-weight: bold;
+            padding: 20px 40px;
+            border: none;
+            border-radius: 50px;
+            cursor: pointer;
+            margin-top: 30px;
+            box-shadow: 0 4px 15px rgba(157, 132, 255, 0.4);
+        }
+        #start-btn:active {
+            transform: scale(0.95);
+        }
+        
+        #app-content {
+            display: none;
             flex-direction: column;
             align-items: center;
-            justify-content: center;
-            z-index: 999;
-            cursor: pointer;
-        }
-        #audio-unlock-overlay p {
-            color: #9d84ff;
-            font-size: 1.3rem;
-            margin: 10px 20px;
+            width: 100%;
         }
     </style>
 </head>
 <body>
 
-    <div id="audio-unlock-overlay">
-        <p>Tap to Connect Audio & Mic</p>
+    <button id="start-btn">TAP TO START</button>
+
+    <div id="app-content">
+        <h1>ACAAN</h1>
+        <div id="status">Starting mic...</div>
+        <div id="debug"></div>
+        <div id="result"></div>
     </div>
-
-    <h1>ACAAN</h1>
-    <div id="status">Connecting...</div>
-    <div id="debug"></div>
-    <div id="result"></div>
-
-    <!-- Hidden audio element for Bluetooth media routing -->
-    <audio id="mediaAudio" playsinline preload="auto"></audio>
 
     <script>
         const stack = [
@@ -66,19 +70,18 @@
             "ace of hearts", "9 of diamonds"
         ];
 
-        const overlay = document.getElementById('audio-unlock-overlay');
+        const startBtn = document.getElementById('start-btn');
+        const appContent = document.getElementById('app-content');
         const statusEl = document.getElementById('status');
         const debugEl = document.getElementById('debug');
         const resultEl = document.getElementById('result');
-        const mediaAudio = document.getElementById('mediaAudio');
 
         let recognition;
-        let isListening = false;
         let isSpeaking = false;
         let isAppActive = true;
+        let selectedVoice = null;
         let speechFailSafeTimeout = null;
 
-        // Initialize Speech Recognition
         if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
             const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
             recognition = new SpeechRecognition();
@@ -87,7 +90,6 @@
             recognition.lang = 'en-SG';
 
             recognition.onstart = () => {
-                isListening = true;
                 if (isAppActive && !isSpeaking) statusEl.innerText = "Listening...";
             };
 
@@ -105,28 +107,36 @@
             };
 
             recognition.onend = () => {
-                isListening = false;
                 if (!isSpeaking && isAppActive) {
-                    setTimeout(() => {
-                        try { recognition.start(); } catch(e) {}
-                    }, 300);
+                    setTimeout(startMicSafely, 300);
                 }
             };
         } else {
             statusEl.innerText = "Speech recognition not supported.";
         }
 
-        // Tap once to unlock both Web Audio (for Bluetooth) and request microphone
-        overlay.addEventListener('click', async () => {
-            overlay.style.display = 'none';
+        function startMicSafely() {
+            if (!isSpeaking && isAppActive && recognition) {
+                try {
+                    recognition.start();
+                } catch(e) {}
+            }
+        }
 
-            // 1. Prime the media audio player with a silent sample to unlock Bluetooth routing
-            mediaAudio.src = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA";
-            try {
-                await mediaAudio.play();
-            } catch (e) {}
+        function loadVoices() {
+            const voices = window.speechSynthesis.getVoices();
+            if (voices.length > 0) {
+                selectedVoice = voices.find(voice => voice.lang.includes('en')) || voices[0];
+            }
+        }
+        window.speechSynthesis.onvoiceschanged = loadVoices;
 
-            // 2. Prime speech synthesis as secondary backup
+        startBtn.addEventListener('click', () => {
+            startBtn.style.display = 'none';
+            appContent.style.display = 'flex';
+            loadVoices();
+
+            // Unlock audio natively
             if ('speechSynthesis' in window) {
                 window.speechSynthesis.resume();
                 const unlock = new SpeechSynthesisUtterance(' ');
@@ -134,25 +144,17 @@
                 window.speechSynthesis.speak(unlock);
             }
 
-            // 3. Start recognition
-            if (recognition) {
-                try {
-                    recognition.start();
-                } catch(e) {}
-            }
+            setTimeout(startMicSafely, 200);
         });
 
-        // App backgrounding logic
         document.addEventListener('visibilitychange', () => {
             if (document.hidden) {
                 isAppActive = false;
-                if (recognition) recognition.abort();
+                if (recognition) recognition.stop();
             } else {
                 isAppActive = true;
-                if (recognition && !isListening && !isSpeaking) {
-                    setTimeout(() => {
-                        try { recognition.start(); } catch(e) {}
-                    }, 400);
+                if (!isSpeaking) {
+                    setTimeout(startMicSafely, 400);
                 }
             }
         });
@@ -201,7 +203,6 @@
                     }
                 }
             }
-
             return bestScore <= 5 ? { card: bestMatch, index: bestIndex } : null;
         }
 
@@ -242,67 +243,49 @@
                     resultEl.innerText = outputText;
                     resultEl.style.display = 'block';
 
-                    speakViaMedia(outputText);
+                    speakResult(outputText);
                 }
             }
         }
 
-        function finishSpeakingAndRestartMic() {
-            if (!isSpeaking) return;
-            isSpeaking = false;
-            clearTimeout(speechFailSafeTimeout);
-            
-            if (isAppActive) {
-                statusEl.innerText = "Listening...";
-                setTimeout(() => {
-                    try { recognition.start(); } catch(e) {}
-                }, 300);
-            }
-        }
-
-        // Plays audio over standard iOS Media Channel (Bluetooth / Earpiece compatible)
-        function speakViaMedia(text) {
+        function speakResult(text) {
             isSpeaking = true;
             statusEl.innerText = "Speaking...";
             
-            // 1. Release microphone focus
+            // 1. Politely ask the mic to stop to free the channel
             if (recognition) {
-                recognition.abort();
+                recognition.stop();
             }
 
-            // 2. Encode text for speech stream
-            const cleanText = text.replace(/[()]/g, '');
-            const audioUrl = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(cleanText)}&tl=en&client=tw-ob`;
-
-            mediaAudio.src = audioUrl;
-
-            mediaAudio.onended = () => {
-                finishSpeakingAndRestartMic();
-            };
-
-            mediaAudio.onerror = () => {
-                // If network audio fails, fall back to native speech
-                if ('speechSynthesis' in window) {
-                    const fallback = new SpeechSynthesisUtterance(text);
-                    fallback.rate = 1.0;
-                    fallback.onend = finishSpeakingAndRestartMic;
-                    fallback.onerror = finishSpeakingAndRestartMic;
-                    window.speechSynthesis.speak(fallback);
-                } else {
-                    finishSpeakingAndRestartMic();
-                }
-            };
-
+            // 2. Wait 600ms to ensure the mic completely disengages in iOS before pushing audio
             setTimeout(() => {
-                mediaAudio.play().catch(() => {
-                    finishSpeakingAndRestartMic();
-                });
-            }, 300);
+                window.speechSynthesis.cancel();
+                
+                const utterance = new SpeechSynthesisUtterance(text);
+                utterance.rate = 1.0;
+                if (selectedVoice) utterance.voice = selectedVoice;
 
-            // Fail-safe to prevent lockup
-            speechFailSafeTimeout = setTimeout(() => {
-                finishSpeakingAndRestartMic();
-            }, 5000);
+                utterance.onend = () => {
+                    isSpeaking = false;
+                    clearTimeout(speechFailSafeTimeout);
+                    // Wait 500ms after speaking before turning mic back on to prevent overlap
+                    setTimeout(startMicSafely, 500);
+                };
+
+                utterance.onerror = () => {
+                    isSpeaking = false;
+                    clearTimeout(speechFailSafeTimeout);
+                    setTimeout(startMicSafely, 500);
+                };
+
+                window.speechSynthesis.speak(utterance);
+
+                speechFailSafeTimeout = setTimeout(() => {
+                    isSpeaking = false;
+                    startMicSafely();
+                }, 5000);
+
+            }, 600);
         }
     </script>
 </body>
