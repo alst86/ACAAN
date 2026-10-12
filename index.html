@@ -51,6 +51,7 @@
         let isListening = false;
         let voiceUnlocked = false;
         let isSpeaking = false; 
+        let isAppActive = true;
         
         window.currentUtterance = null;
         let speechFailSafeTimeout = null;
@@ -61,11 +62,11 @@
             recognition = new SpeechRecognition();
             recognition.continuous = true;
             recognition.interimResults = false;
-            recognition.lang = 'en-US';
+            recognition.lang = 'en-SG'; // Set specifically to English (Singapore)
 
             recognition.onstart = () => {
                 isListening = true;
-                statusEl.innerText = "Listening...";
+                if (isAppActive) statusEl.innerText = "Listening...";
             };
 
             recognition.onresult = (event) => {
@@ -78,14 +79,14 @@
             };
 
             recognition.onerror = (event) => {
-                if(event.error !== 'no-speech' && !isSpeaking) {
+                if(event.error !== 'no-speech' && !isSpeaking && isAppActive) {
                     statusEl.innerText = "Error, restarting mic...";
                 }
             };
 
             recognition.onend = () => {
                 isListening = false;
-                if (!isSpeaking) {
+                if (!isSpeaking && isAppActive) {
                     setTimeout(() => {
                         try { recognition.start(); } catch(e) {}
                     }, 400);
@@ -95,7 +96,26 @@
             statusEl.innerText = "Speech recognition not supported in this browser.";
         }
 
-        // Force load voices to memory
+        // --- App Lifecycle Management (Turn mic off when closed/backgrounded) ---
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) {
+                isAppActive = false;
+                if (recognition) recognition.abort(); // Kill mic immediately
+            } else {
+                isAppActive = true;
+                if (recognition && !isListening && !isSpeaking) {
+                    setTimeout(() => {
+                        try { recognition.start(); } catch(e) {}
+                    }, 400);
+                }
+            }
+        });
+
+        window.addEventListener('pagehide', () => {
+            if (recognition) recognition.abort();
+        });
+        // ------------------------------------------------------------------------
+
         function loadVoices() {
             const voices = window.speechSynthesis.getVoices();
             if (voices.length > 0) {
@@ -122,7 +142,7 @@
 
         window.addEventListener('load', () => {
             loadVoices();
-            if (recognition && !isListening) {
+            if (recognition && !isListening && isAppActive) {
                 try { recognition.start(); } catch(e) {}
             }
         });
@@ -217,10 +237,12 @@
             isSpeaking = false;
             clearTimeout(speechFailSafeTimeout);
             
-            statusEl.innerText = "Listening...";
-            setTimeout(() => {
-                try { recognition.start(); } catch(e) {}
-            }, 400);
+            if (isAppActive) {
+                statusEl.innerText = "Listening...";
+                setTimeout(() => {
+                    try { recognition.start(); } catch(e) {}
+                }, 400);
+            }
         }
 
         function speak(text) {
@@ -238,7 +260,6 @@
                 window.currentUtterance.rate = 1.0;
                 window.currentUtterance.volume = 1.0;
                 
-                // Explicitly assign the loaded voice
                 if (selectedVoice) {
                     window.currentUtterance.voice = selectedVoice;
                 }
@@ -257,7 +278,7 @@
                     finishSpeakingAndRestartMic();
                 }, 4000);
                 
-            }, 400); // Slightly longer delay to fully release the mic channel
+            }, 400); 
         }
     </script>
 </body>
