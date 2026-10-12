@@ -22,7 +22,7 @@
         }
         h1 { color: #9d84ff; font-size: 2rem; margin-bottom: 10px; }
         #status { font-size: 1.2rem; margin-top: 20px; color: #a0a5b5; }
-        #debug { font-size: 0.9rem; margin-top: 10px; color: #555; font-style: italic; min-height: 20px; }
+        #debug { font-size: 0.9rem; margin-top: 10px; color: #555; font-style: italic; min-height: 20px; padding: 0 20px; }
         #result { font-size: 1.5rem; margin-top: 30px; font-weight: bold; color: #ffffff; padding: 20px; border-radius: 10px; background: #232533; display: none; width: 80%; }
     </style>
 </head>
@@ -50,6 +50,7 @@
         let recognition;
         let isListening = false;
         let voiceUnlocked = false;
+        let isSpeaking = false; 
         
         if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
             const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -80,21 +81,21 @@
 
             recognition.onend = () => {
                 isListening = false;
-                setTimeout(() => {
-                    try { recognition.start(); } catch(e) {}
-                }, 400);
+                if (!isSpeaking) {
+                    setTimeout(() => {
+                        try { recognition.start(); } catch(e) {}
+                    }, 400);
+                }
             };
         } else {
             statusEl.innerText = "Speech recognition not supported in this browser.";
         }
 
-        // Robust iOS Voice Unlocker
         document.body.addEventListener('touchstart', () => {
             if (!voiceUnlocked) {
-                // Resume audio context and play a silent utterance
                 window.speechSynthesis.resume();
                 const unlockUtterance = new SpeechSynthesisUtterance('');
-                unlockUtterance.volume = 0; // silent
+                unlockUtterance.volume = 0; 
                 window.speechSynthesis.speak(unlockUtterance);
                 
                 voiceUnlocked = true;
@@ -108,43 +109,80 @@
             }
         });
 
-        function processInput(text) {
-            text = text.replace(/\bone\b/g, "1")
-                       .replace(/\btwo\b/g, "2")
-                       .replace(/\bthree\b/g, "3")
-                       .replace(/\bfour\b/g, "4")
-                       .replace(/\bfive\b/g, "5")
-                       .replace(/\bsix\b/g, "6")
-                       .replace(/\bseven\b/g, "7")
-                       .replace(/\beight\b/g, "8")
-                       .replace(/\bnine\b/g, "9")
-                       .replace(/\bten\b/g, "10");
+        // Levenshtein distance algorithm for fuzzy matching strings
+        function getEditDistance(a, b) {
+            if (a.length === 0) return b.length;
+            if (b.length === 0) return a.length;
+            const matrix = Array.from({ length: a.length + 1 }, (_, i) => [i]);
+            for (let j = 0; j <= b.length; j++) matrix[0][j] = j;
+            for (let i = 1; i <= a.length; i++) {
+                for (let j = 1; j <= b.length; j++) {
+                    if (a[i - 1] === b[j - 1]) matrix[i][j] = matrix[i - 1][j - 1];
+                    else matrix[i][j] = Math.min(matrix[i - 1][j - 1], matrix[i][j - 1], matrix[i - 1][j]) + 1;
+                }
+            }
+            return matrix[a.length][b.length];
+        }
 
-            let foundCard = null;
-            let cardIndex = -1;
+        function findBestCardMatch(text) {
+            let bestMatch = null;
+            let bestScore = Infinity;
+            let bestIndex = -1;
 
+            // Generate "sliding windows" of the transcript to match against card names
+            const words = text.split(" ");
+            
             for (let i = 0; i < stack.length; i++) {
-                if (text.includes(stack[i])) {
-                    foundCard = stack[i];
-                    cardIndex = i;
-                    break;
+                const card = stack[i];
+                const cardWordCount = card.split(" ").length;
+                
+                // If the transcript is shorter than the card name, compare directly
+                if (words.length <= cardWordCount) {
+                    const distance = getEditDistance(text, card);
+                    if (distance < bestScore) {
+                        bestScore = distance;
+                        bestMatch = card;
+                        bestIndex = i;
+                    }
+                    continue;
+                }
+
+                // Otherwise, slide through the transcript words to find the closest match phrase
+                for (let j = 0; j <= words.length - cardWordCount; j++) {
+                    const snippet = words.slice(j, j + cardWordCount).join(" ");
+                    const distance = getEditDistance(snippet, card);
+                    
+                    if (distance < bestScore) {
+                        bestScore = distance;
+                        bestMatch = card;
+                        bestIndex = i;
+                    }
                 }
             }
 
+            // Threshold: if the distance is too high (e.g., > 5), it's probably just random noise, not a card.
+            return bestScore <= 5 ? { card: bestMatch, index: bestIndex } : null;
+        }
+
+        function processInput(text) {
+            text = text.replace(/\bone\b/g, "1").replace(/\btwo\b/g, "2").replace(/\bthree\b/g, "3")
+                       .replace(/\bfour\b/g, "4").replace(/\bfive\b/g, "5").replace(/\bsix\b/g, "6")
+                       .replace(/\bseven\b/g, "7").replace(/\beight\b/g, "8").replace(/\bnine\b/g, "9")
+                       .replace(/\bten\b/g, "10");
+
+            const matchResult = findBestCardMatch(text);
             const numberMatch = text.match(/\b([1-9]|[1-4][0-9]|5[0-2])\b/);
             
-            if (foundCard && numberMatch) {
+            if (matchResult && numberMatch) {
                 const targetPosition = parseInt(numberMatch[1], 10);
-                const currentPosition = cardIndex + 1; 
+                const currentPosition = matchResult.index + 1; 
 
                 let cutAmount = currentPosition - targetPosition;
                 if (cutAmount < 0) {
                     cutAmount += 52;
                 }
 
-                if (cutAmount === 0) {
-                    return; 
-                }
+                if (cutAmount === 0) return; 
 
                 const bottomCardIndex = (cutAmount - 1 + 52) % 52;
                 const bottomCard = stack[bottomCardIndex];
@@ -160,11 +198,36 @@
         }
 
         function speak(text) {
+            isSpeaking = true;
+            statusEl.innerText = "Speaking...";
+            
+            if (recognition) {
+                recognition.abort();
+            }
+
             window.speechSynthesis.cancel(); 
             const utterance = new SpeechSynthesisUtterance(text);
             utterance.rate = 1.0;
             utterance.volume = 1.0;
-            window.speechSynthesis.speak(utterance);
+
+            utterance.onend = () => {
+                isSpeaking = false;
+                statusEl.innerText = "Listening...";
+                setTimeout(() => {
+                    try { recognition.start(); } catch(e) {}
+                }, 300);
+            };
+
+            utterance.onerror = () => {
+                isSpeaking = false;
+                setTimeout(() => {
+                    try { recognition.start(); } catch(e) {}
+                }, 300);
+            };
+
+            setTimeout(() => {
+                window.speechSynthesis.speak(utterance);
+            }, 300);
         }
     </script>
 </body>
