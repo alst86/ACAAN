@@ -75,7 +75,7 @@
                     audioContext.resume();
                 }
                 audioUnlocked = true;
-                debugEl.innerText = "Earpiece ready. Speak card and position.";
+                debugEl.innerText = "Earpiece ready.";
             }
         });
 
@@ -196,7 +196,6 @@
             }
             let average = sum / dataArray.length;
 
-            // Lowered from 15 to 10 so the first word ("10 of...") is never clipped
             const SPEECH_THRESHOLD = 10; 
 
             if (average > SPEECH_THRESHOLD) {
@@ -209,7 +208,6 @@
                 
                 clearTimeout(silenceTimer);
                 
-                // 1.6s pause window allows natural breathing between naming card and position
                 silenceTimer = setTimeout(() => {
                     if (isRecording && mediaRecorder && mediaRecorder.state !== 'inactive') {
                         isRecording = false;
@@ -221,11 +219,9 @@
             animationFrameId = requestAnimationFrame(monitorAudioLevel);
         }
 
-        // --- STRICT CARD, SUIT & POSITION VALIDATION ---
         function parseCardAndPosition(rawText) {
             const cleanRaw = rawText.trim();
 
-            // Ignore pure silence or Whisper background noise hallucinations silently
             if (
                 cleanRaw.length < 2 ||
                 /^(you|thank you|thanks|bye|okay|oh|uh|um)$/i.test(cleanRaw) ||
@@ -250,7 +246,6 @@
             }
             text = text.replace(/\b(20|30|40|50)\s+([1-9])\b/g, (m, tens, ones) => String(parseInt(tens) + parseInt(ones)));
 
-            // 1. Identify Suit
             const suitMatch = text.match(/\b(clubs?|clovers?|flowers?|hearts?|spades?|diamonds?)\b/);
             if (!suitMatch) return { valid: false, silentIgnore: false };
 
@@ -260,7 +255,6 @@
             else if (suit.startsWith('spade')) suit = 'spades';
             else if (suit.startsWith('diamond')) suit = 'diamonds';
 
-            // 2. Identify Card Value
             const valueMatch = text.match(/\b(ace|jack|queen|king|10|[2-9])\b/);
             if (!valueMatch) return { valid: false, silentIgnore: false };
 
@@ -270,7 +264,6 @@
             const cardIndex = stack.indexOf(targetCard);
             if (cardIndex === -1) return { valid: false, silentIgnore: false };
 
-            // 3. Identify Target Position (1 to 52)
             let remainingText = text.replace(valueMatch[0], ' ').replace(suitMatch[0], ' ');
             const numbersFound = remainingText.match(/\b([1-9]|[1-4][0-9]|5[0-2])\b/g);
             if (!numbersFound || numbersFound.length === 0) return { valid: false, silentIgnore: false };
@@ -290,11 +283,10 @@
 
             if (!parsed.valid) {
                 resultEl.style.display = 'none';
-                debugEl.innerText = `Heard: "${rawText}" (Need card value, suit & number)`;
+                debugEl.innerText = `Heard: "${rawText}" (Incomplete)`;
                 
-                // If real speech was detected but incomplete, notify via earpiece immediately
                 if (!parsed.silentIgnore) {
-                    speakResult("Missed, repeat.");
+                    speakResult("Repeat.");
                 } else {
                     resetToListening();
                 }
@@ -309,10 +301,10 @@
             if (cutAmount < 0) cutAmount += 52;
 
             if (cutAmount === 0) {
-                debugEl.innerText = `Heard: ${formattedHeardCard} at ${targetPosition}`;
-                resultEl.innerText = `${formattedHeardCard} at ${targetPosition} — Cut 0.`;
+                debugEl.innerText = `${formattedHeardCard} at ${targetPosition}`;
+                resultEl.innerText = `Cut 0 (${formattedHeardCard})`;
                 resultEl.style.display = 'block';
-                speakResult(`${formattedHeardCard} at ${targetPosition}. Already there, cut zero.`);
+                speakResult(`${formattedHeardCard}, ${targetPosition}. Cut zero.`);
                 return;
             }
 
@@ -320,11 +312,11 @@
             const bottomCard = stack[bottomCardIndex];
             const formattedBottom = bottomCard.replace(/\b\w/g, c => c.toUpperCase());
             
-            // Confirms the heard card + position first, then gives the cut instruction
-            const outputText = `${formattedHeardCard} at ${targetPosition}. Cut ${cutAmount} cards, ${formattedBottom}.`;
+            // Concise spoken output
+            const outputText = `${formattedHeardCard}, ${targetPosition}. Cut ${cutAmount}, ${formattedBottom}.`;
 
-            debugEl.innerText = `Heard: ${formattedHeardCard} at position ${targetPosition}`;
-            resultEl.innerText = `Cut ${cutAmount} cards (${formattedBottom}).`;
+            debugEl.innerText = `${formattedHeardCard} at ${targetPosition}`;
+            resultEl.innerText = `Cut ${cutAmount} (${formattedBottom})`;
             resultEl.style.display = 'block';
 
             speakResult(outputText);
@@ -341,7 +333,7 @@
 
             speechFailSafeTimeout = setTimeout(() => {
                 resetToListening();
-            }, 8000);
+            }, 7000);
 
             try {
                 const res = await fetch('/api/transcribe', {
