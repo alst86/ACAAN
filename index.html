@@ -63,6 +63,7 @@
         let audioChunks = [];
         let isRecording = false;
         let silenceTimer = null;
+        let maxRecordTimer = null;
         let analyser = null;
         let dataArray = null;
         let animationFrameId = null;
@@ -83,7 +84,14 @@
             if (audioStream) return; 
 
             try {
-                audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                // Enable hardware noise suppression & echo cancellation for noisy venues
+                audioStream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    } 
+                });
                 
                 audioContext = new (window.AudioContext || window.webkitAudioContext)();
                 const source = audioContext.createMediaStreamSource(audioStream);
@@ -96,6 +104,10 @@
                 mediaRecorder.ondataavailable = e => { if (e.data.size > 0) audioChunks.push(e.data); };
                 
                 mediaRecorder.onstop = async () => {
+                    clearTimeout(silenceTimer);
+                    clearTimeout(maxRecordTimer);
+                    isRecording = false;
+
                     if (audioChunks.length === 0) return;
                     const audioBlob = new Blob(audioChunks, { type: 'audio/mp4' });
                     audioChunks = []; 
@@ -166,6 +178,7 @@
                 audioContext = null;
             }
             clearTimeout(silenceTimer);
+            clearTimeout(maxRecordTimer);
             clearTimeout(speechFailSafeTimeout);
             isRecording = false;
             isSpeaking = false;
@@ -196,7 +209,8 @@
             }
             let average = sum / dataArray.length;
 
-            const SPEECH_THRESHOLD = 10; 
+            // Balanced threshold for voice over background room noise
+            const SPEECH_THRESHOLD = 14; 
 
             if (average > SPEECH_THRESHOLD) {
                 if (!isRecording && mediaRecorder && mediaRecorder.state === 'inactive') {
@@ -204,6 +218,14 @@
                     mediaRecorder.start();
                     statusEl.innerText = "Recording...";
                     statusEl.style.color = "#ff5555"; 
+
+                    // Safety cap: Force analysis after 6.5s even if room noise never drops to silence
+                    maxRecordTimer = setTimeout(() => {
+                        if (isRecording && mediaRecorder && mediaRecorder.state !== 'inactive') {
+                            isRecording = false;
+                            mediaRecorder.stop();
+                        }
+                    }, 6500);
                 }
                 
                 clearTimeout(silenceTimer);
@@ -213,25 +235,26 @@
                         isRecording = false;
                         mediaRecorder.stop(); 
                     }
-                }, 1600); 
+                }, 1400); 
             }
             
             animationFrameId = requestAnimationFrame(monitorAudioLevel);
         }
 
+        // --- CONVERSATION-SAFE PARSER ---
         function parseCardAndPosition(rawText) {
             const cleanRaw = rawText.trim();
 
             if (
                 cleanRaw.length < 2 ||
-                /^(you|thank you|thanks|bye|okay|oh|uh|um)$/i.test(cleanRaw) ||
                 /thank you for|watching|joining|subtitles|amara\.org/i.test(cleanRaw)
             ) {
-                return { valid: false, silentIgnore: true };
+                return { valid: false, partialCardHeard: false };
             }
 
-            let text = cleanRaw.toLowerCase().replace(/[.,!?]/g, ' ').replace(/\s+/g, ' ').trim();
+            let text = cleanRaw.toLowerCase().replace(/[.,!?-]/g, ' ').replace(/\s+/g, ' ').trim();
 
+            // Convert spoken number words to digits
             const wordToNum = {
                 'one': '1', 'two': '2', 'to': '2', 'too': '2', 'three': '3', 'tree': '3',
                 'four': '4', 'for': '4', 'ford': '4', 'five': '5', 'six': '6', 'seven': '7',
@@ -246,27 +269,63 @@
             }
             text = text.replace(/\b(20|30|40|50)\s+([1-9])\b/g, (m, tens, ones) => String(parseInt(tens) + parseInt(ones)));
 
-            const suitMatch = text.match(/\b(clubs?|clovers?|flowers?|hearts?|spades?|diamonds?)\b/);
-            if (!suitMatch) return { valid: false, silentIgnore: false };
+            // Strip common magician patter phrases so they don't trigger false numbers
+            text = text.replace(/\b1\s+(?:2|to)\s+52\b/g, ' ')
+                       .replace(/\b52\s+cards?\b/g, ' ');
 
-            let suit = suitMatch[1];
+            // Check if ANY card-related keyword was spoken (to decide whether to say "Repeat" on failure)
+            const hasSuitKeyword = /\b(clubs?|clovers?|flowers?|hearts?|spades?|diamonds?)\b/.test(text);
+            const hasFaceKeyword = /\b(ace|jack|queen|king)\b/.test(text);
+            const partialCardHeard = hasSuitKeyword || hasFaceKeyword;
+
+            if (!hasSuitKeyword) {
+                // Normal conversation without any suit mentioned -> Ignore silently
+                return { valid: false, partialCardHeard: hasFaceKeyword };
+            }
+
+            // 1. Lock onto Value + Suit spoken together (e.g., "10 of spades" or "10 spades")
+            const pairedCardRegex = /\b(ace|jack|queen|king|10|[2-9])(?:\s+(?:of|in|on|at|4|2))?\s+(clubs?|clovers?|flowers?|hearts?|spades?|diamonds?)\b/;
+            const pairedMatch = text.match(pairedCardRegex);
+
+            let value = null;
+            let rawSuit = null;
+            let remainingText = text;
+
+            if (pairedMatch) {
+                value = pairedMatch[1];
+                rawSuit = pairedMatch[2];
+                remainingText = text.replace(pairedMatch[0], ' ');
+            } else {
+                // Fallback if words were separated
+                const suitMatch = text.match(/\b(clubs?|clovers?|flowers?|hearts?|spades?|diamonds?)\b/);
+                const valueMatch = text.match(/\b(ace|jack|queen|king|10|[2-9])\b/);
+                if (!suitMatch || !valueMatch) {
+                    return { valid: false, partialCardHeard: true };
+                }
+                value = valueMatch[1];
+                rawSuit = suitMatch[1];
+                remainingText = text.replace(valueMatch[0], ' ').replace(suitMatch[0], ' ');
+            }
+
+            // Normalize suit name
+            let suit = rawSuit;
             if (suit.startsWith('club') || suit.startsWith('clover') || suit.startsWith('flower')) suit = 'clubs';
             else if (suit.startsWith('heart')) suit = 'hearts';
             else if (suit.startsWith('spade')) suit = 'spades';
             else if (suit.startsWith('diamond')) suit = 'diamonds';
 
-            const valueMatch = text.match(/\b(ace|jack|queen|king|10|[2-9])\b/);
-            if (!valueMatch) return { valid: false, silentIgnore: false };
-
-            let value = valueMatch[1];
             const targetCard = `${value} of ${suit}`;
-
             const cardIndex = stack.indexOf(targetCard);
-            if (cardIndex === -1) return { valid: false, silentIgnore: false };
+            if (cardIndex === -1) {
+                return { valid: false, partialCardHeard: true };
+            }
 
-            let remainingText = text.replace(valueMatch[0], ' ').replace(suitMatch[0], ' ');
+            // 2. Extract target position (1 to 52) from remaining sentence
             const numbersFound = remainingText.match(/\b([1-9]|[1-4][0-9]|5[0-2])\b/g);
-            if (!numbersFound || numbersFound.length === 0) return { valid: false, silentIgnore: false };
+            if (!numbersFound || numbersFound.length === 0) {
+                // Heard a valid card (e.g., "10 of Spades"), but missed the position number!
+                return { valid: false, partialCardHeard: true };
+            }
 
             const targetPosition = parseInt(numbersFound[numbersFound.length - 1], 10);
 
@@ -282,12 +341,13 @@
             const parsed = parseCardAndPosition(rawText);
 
             if (!parsed.valid) {
-                resultEl.style.display = 'none';
-                debugEl.innerText = `Heard: "${rawText}" (Incomplete)`;
-                
-                if (!parsed.silentIgnore) {
+                // Only say "Repeat" if you actually tried to name a card/suit and it missed part of it
+                if (parsed.partialCardHeard) {
+                    debugEl.innerText = `Missed part of card: "${rawText}"`;
                     speakResult("Repeat.");
                 } else {
+                    // Normal conversation or background chatter -> Stay 100% silent
+                    debugEl.innerText = `Ignored chatter: "${rawText}"`;
                     resetToListening();
                 }
                 return;
@@ -312,7 +372,6 @@
             const bottomCard = stack[bottomCardIndex];
             const formattedBottom = bottomCard.replace(/\b\w/g, c => c.toUpperCase());
             
-            // Concise spoken output
             const outputText = `${formattedHeardCard}, ${targetPosition}. Cut ${cutAmount}, ${formattedBottom}.`;
 
             debugEl.innerText = `${formattedHeardCard} at ${targetPosition}`;
