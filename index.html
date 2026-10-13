@@ -21,7 +21,7 @@
             user-select: none;
         }
         h1 { color: #9d84ff; font-size: 2rem; margin-bottom: 10px; }
-        #status { font-size: 1.2rem; margin-top: 20px; color: #a0a5b5; transition: color 0.2s; }
+        #status { font-size: 1.2rem; margin-top: 20px; color: #a0a5b5; transition: color 0.15s; }
         #debug { font-size: 0.9rem; margin-top: 10px; color: #777; font-style: italic; min-height: 24px; padding: 0 20px; }
         #result { font-size: 1.4rem; margin-top: 30px; font-weight: bold; color: #ffffff; padding: 20px; border-radius: 10px; background: #232533; display: none; width: 80%; }
         #app-content { display: flex; flex-direction: column; align-items: center; width: 100%; }
@@ -37,15 +37,6 @@
     </div>
 
     <script>
-        const stack = [
-            "4 of clubs", "2 of hearts", "7 of diamonds", "3 of clubs", "4 of hearts", "6 of diamonds", "ace of spades", "5 of hearts", "9 of spades", "2 of spades",
-            "queen of hearts", "3 of diamonds", "queen of clubs", "8 of hearts", "6 of spades", "5 of spades", "9 of hearts", "king of clubs", "2 of diamonds", "jack of hearts",
-            "3 of spades", "8 of spades", "6 of hearts", "10 of clubs", "5 of diamonds", "king of diamonds", "2 of clubs", "3 of hearts", "8 of diamonds", "5 of clubs",
-            "king of spades", "jack of diamonds", "8 of clubs", "10 of spades", "king of hearts", "jack of clubs", "7 of spades", "10 of hearts", "ace of diamonds", "4 of spades",
-            "7 of hearts", "4 of diamonds", "ace of clubs", "9 of clubs", "jack of spades", "queen of diamonds", "7 of clubs", "queen of spades", "10 of diamonds", "6 of clubs",
-            "ace of hearts", "9 of diamonds"
-        ];
-
         const statusEl = document.getElementById('status');
         const debugEl = document.getElementById('debug');
         const resultEl = document.getElementById('result');
@@ -61,14 +52,17 @@
         let silenceTimer = null;
         let maxRecordTimer = null;
 
-        // Raw PCM Recording Buffers (No MediaRecorder needed)
         let preRollChunks = [];
         let recordedChunks = [];
-        const PRE_ROLL_MAX_CHUNKS = 6; // ~0.5s pre-roll so first word is never clipped
+        const PRE_ROLL_MAX_CHUNKS = 5; 
 
-        // 2-Breath Memory if card and number are spoken with a pause between them
+        // Two-way memory: works whether you say Card first OR Position first
         let pendingCard = null;
-        let pendingCardTimer = null;
+        let pendingPosition = null;
+        let pendingTimer = null;
+
+        // Pre-cached "Repeat." audio so missed input alerts play in 0ms
+        let cachedRepeatBase64 = null;
 
         function unlockAudioContext() {
             if (!audioContext) return;
@@ -87,6 +81,18 @@
         document.body.addEventListener('touchend', unlockAudioContext, { passive: true });
         document.body.addEventListener('click', unlockAudioContext);
 
+        async function preloadRepeatAudio() {
+            try {
+                const res = await fetch('/api/transcribe', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ action: 'tts', text: 'Repeat.' })
+                });
+                const data = await res.json();
+                if (data.audio) cachedRepeatBase64 = data.audio;
+            } catch (e) {}
+        }
+
         async function startListening() {
             if (audioStream) return; 
 
@@ -95,8 +101,8 @@
                 audioContext = new (window.AudioContext || window.webkitAudioContext)();
                 const sourceNode = audioContext.createMediaStreamSource(audioStream);
 
-                // Direct PCM capture node — bypasses buggy iOS MediaRecorder completely
-                processorNode = audioContext.createScriptProcessor(4096, 1, 1);
+                // 2048 buffer size (~46ms latency) for faster speech cutoff response
+                processorNode = audioContext.createScriptProcessor(2048, 1, 1);
                 const silentGain = audioContext.createGain();
                 silentGain.gain.value = 0;
 
@@ -110,7 +116,6 @@
                     const inputData = e.inputBuffer.getChannelData(0);
                     const chunkCopy = new Float32Array(inputData);
 
-                    // Calculate peak level (0 - 100 scale)
                     let maxPeak = 0;
                     for (let i = 0; i < chunkCopy.length; i++) {
                         const abs = Math.abs(chunkCopy[i]);
@@ -120,7 +125,6 @@
                     const SPEECH_THRESHOLD = 8;
 
                     if (!isRecording) {
-                        // Maintain rolling 0.5s pre-roll buffer
                         preRollChunks.push(chunkCopy);
                         if (preRollChunks.length > PRE_ROLL_MAX_CHUNKS) {
                             preRollChunks.shift();
@@ -134,48 +138,60 @@
                     if (displayLevel > SPEECH_THRESHOLD) {
                         if (!isRecording) {
                             isRecording = true;
-                            // Prepend pre-roll so the start of the word is never cut off
                             recordedChunks = [...preRollChunks, chunkCopy];
                             preRollChunks = [];
                             statusEl.innerText = "Recording...";
                             statusEl.style.color = "#ff5555";
 
-                            // Pause pending-card timeout while user is actively speaking
-                            if (pendingCardTimer) {
-                                clearTimeout(pendingCardTimer);
-                            }
+                            if (pendingTimer) clearTimeout(pendingTimer);
 
                             maxRecordTimer = setTimeout(() => {
                                 if (isRecording) finishRecordingAndTranscribe();
-                            }, 5500);
+                            }, 4200);
                         }
 
                         clearTimeout(silenceTimer);
+                        // Fast 750ms silence trigger saves ~0.85s after you finish speaking
                         silenceTimer = setTimeout(() => {
                             if (isRecording) finishRecordingAndTranscribe();
-                        }, 1600);
+                        }, 750);
                     }
                 };
 
                 resetToListening();
+                preloadRepeatAudio();
 
             } catch (err) {
                 statusEl.innerText = "Mic Permission Denied";
             }
         }
 
-        // Encode raw Float32 audio into a compact 16kHz Mono WAV file
+        // Fast 8kHz WAV encoder + trims silent tail chunks
         function encodeWAV(chunks, inputSampleRate) {
+            // Trim trailing silent chunks so Whisper processes faster
+            let endIdx = chunks.length;
+            while (endIdx > 4) {
+                const c = chunks[endIdx - 1];
+                let peak = 0;
+                for (let i = 0; i < c.length; i++) {
+                    const a = Math.abs(c[i]);
+                    if (a > peak) peak = a;
+                }
+                if (peak * 140 < 6) endIdx--;
+                else break;
+            }
+            const trimmedChunks = chunks.slice(0, endIdx);
+
             let totalLength = 0;
-            for (const c of chunks) totalLength += c.length;
+            for (const c of trimmedChunks) totalLength += c.length;
             const merged = new Float32Array(totalLength);
             let offset = 0;
-            for (const c of chunks) {
+            for (const c of trimmedChunks) {
                 merged.set(c, offset);
                 offset += c.length;
             }
 
-            const targetRate = 16000;
+            const targetRate = 8000;
             const ratio = inputSampleRate / targetRate;
             const newLength = Math.round(merged.length / ratio);
             const buffer = new ArrayBuffer(44 + newLength * 2);
@@ -240,7 +256,11 @@
                 const res = await fetch('/api/transcribe', { 
                     method: 'POST', 
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ audio: base64Wav })
+                    body: JSON.stringify({
+                        audio: base64Wav,
+                        pendingCard: pendingCard,
+                        pendingPosition: pendingPosition
+                    })
                 });
                 const data = await res.json();
                 isAnalyzing = false;
@@ -251,14 +271,140 @@
                     return;
                 }
 
-                if (data.text) {
-                    processSpeechInput(data.text);
-                } else {
-                    resetToListening();
+                // Single-trip instant resolution (Text + Audio returned together)
+                if (data.resolved) {
+                    clearTimeout(pendingTimer);
+                    pendingCard = null;
+                    pendingPosition = null;
+
+                    debugEl.innerText = data.debugText;
+                    resultEl.innerText = data.resultText;
+                    resultEl.style.display = 'block';
+
+                    if (data.audio) {
+                        playBase64Audio(data.audio);
+                    } else {
+                        resetToListening();
+                    }
+                    return;
                 }
+
+                handleUnresolvedSpeech(data);
             } catch (e) {
                 isAnalyzing = false;
                 debugEl.innerText = "Connection error.";
+                resetToListening();
+            }
+        }
+
+        function startPendingTimeout() {
+            clearTimeout(pendingTimer);
+            pendingTimer = setTimeout(() => {
+                if (pendingCard || pendingPosition) {
+                    pendingCard = null;
+                    pendingPosition = null;
+                    debugEl.innerText = "Timed out waiting for second part.";
+                    playRepeatAlert();
+                }
+            }, 12000);
+        }
+
+        function handleUnresolvedSpeech(data) {
+            const rawText = data.text || "";
+
+            // Card spoken first -> Lock card and wait for position
+            if (data.card && !data.position) {
+                pendingCard = data.card;
+                const formatted = data.card.replace(/\b\w/g, c => c.toUpperCase());
+                debugEl.innerText = `Locked: ${formatted} — Say position...`;
+                startPendingTimeout();
+                resetToListening();
+                return;
+            }
+
+            // Position spoken first (e.g. "37, yes") -> Lock position and wait for card!
+            if (!data.card && data.position) {
+                pendingPosition = data.position;
+                debugEl.innerText = `Locked Position: ${data.position} — Say card...`;
+                startPendingTimeout();
+                resetToListening();
+                return;
+            }
+
+            if (data.partialCardAttempt) {
+                debugEl.innerText = `Missed card value: "${rawText}"`;
+                playRepeatAlert();
+                return;
+            }
+
+            if (pendingCard) {
+                debugEl.innerText = `Locked: ${pendingCard.toUpperCase()} — Waiting for number...`;
+            } else if (pendingPosition) {
+                debugEl.innerText = `Locked Position: ${pendingPosition} — Waiting for card...`;
+            } else {
+                debugEl.innerText = `Ignored chatter: "${rawText}"`;
+            }
+            resetToListening();
+        }
+
+        function playRepeatAlert() {
+            if (cachedRepeatBase64) {
+                playBase64Audio(cachedRepeatBase64);
+            } else {
+                speakFallback("Repeat.");
+            }
+        }
+
+        async function playBase64Audio(base64Audio) {
+            isSpeaking = true;
+            statusEl.innerText = "Speaking...";
+            statusEl.style.color = "#9d84ff";
+
+            speechFailSafeTimeout = setTimeout(() => {
+                resetToListening();
+            }, 6000);
+
+            try {
+                if (audioContext && audioContext.state !== 'running') {
+                    await audioContext.resume().catch(() => {});
+                }
+
+                const binaryString = window.atob(base64Audio);
+                const len = binaryString.length;
+                const bytes = new Uint8Array(len);
+                for (let i = 0; i < len; i++) {
+                    bytes[i] = binaryString.charCodeAt(i);
+                }
+
+                audioContext.decodeAudioData(
+                    bytes.buffer,
+                    (decodedBuffer) => {
+                        const bufferSource = audioContext.createBufferSource();
+                        bufferSource.buffer = decodedBuffer;
+                        bufferSource.connect(audioContext.destination);
+                        bufferSource.onended = () => {
+                            setTimeout(resetToListening, 200);
+                        };
+                        bufferSource.start(0);
+                    },
+                    () => resetToListening()
+                );
+            } catch (e) {
+                resetToListening();
+            }
+        }
+
+        async function speakFallback(text) {
+            try {
+                const res = await fetch('/api/transcribe', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ action: 'tts', text: text })
+                });
+                const data = await res.json();
+                if (data.audio) playBase64Audio(data.audio);
+                else resetToListening();
+            } catch (e) {
                 resetToListening();
             }
         }
@@ -278,7 +424,7 @@
             clearTimeout(silenceTimer);
             clearTimeout(maxRecordTimer);
             clearTimeout(speechFailSafeTimeout);
-            clearTimeout(pendingCardTimer);
+            clearTimeout(pendingTimer);
             if (processorNode) {
                 try { processorNode.disconnect(); } catch (e) {}
                 processorNode = null;
@@ -306,223 +452,6 @@
                 startListening();
             }
         });
-
-        function extractElements(rawText) {
-            const cleanRaw = rawText.trim();
-
-            if (
-                cleanRaw.length < 1 ||
-                /^(you|thank you|thanks|bye|okay|oh|uh|um)$/i.test(cleanRaw) ||
-                /thank you for|watching|joining|subtitles|amara\.org/i.test(cleanRaw)
-            ) {
-                return { card: null, position: null, partialCardAttempt: false };
-            }
-
-            let text = cleanRaw.toLowerCase().replace(/[.,!?-]/g, ' ').replace(/\s+/g, ' ').trim();
-
-            const wordToNum = {
-                'one': '1', 'two': '2', 'to': '2', 'too': '2', 'three': '3', 'tree': '3',
-                'four': '4', 'for': '4', 'ford': '4', 'five': '5', 'six': '6', 'seven': '7',
-                'eight': '8', 'ate': '8', 'nine': '9', 'ten': '10',
-                'eleven': '11', 'twelve': '12', 'thirteen': '13', 'fourteen': '14', 'fifteen': '15',
-                'sixteen': '16', 'seventeen': '17', 'eighteen': '18', 'nineteen': '19', 'twenty': '20',
-                'thirty': '30', 'forty': '40', 'fifty': '50'
-            };
-
-            for (const [w, n] of Object.entries(wordToNum)) {
-                text = text.replace(new RegExp(`\\b${w}\\b`, 'g'), n);
-            }
-            text = text.replace(/\b(20|30|40|50)\s+([1-9])\b/g, (m, tens, ones) => String(parseInt(tens) + parseInt(ones)));
-
-            text = text.replace(/\b1\s+(?:2|to)\s+52\b/g, ' ')
-                       .replace(/\b52\s+cards?\b/g, ' ');
-
-            const hasSuitKeyword = /\b(clubs?|clovers?|flowers?|hearts?|spades?|diamonds?)\b/.test(text);
-            const hasFaceKeyword = /\b(ace|jack|queen|king)\b/.test(text);
-
-            let detectedCard = null;
-            let remainingText = text;
-
-            if (hasSuitKeyword) {
-                const pairedCardRegex = /\b(ace|jack|queen|king|10|[2-9])(?:\s+(?:of|in|on|at|4|2))?\s+(clubs?|clovers?|flowers?|hearts?|spades?|diamonds?)\b/;
-                const pairedMatch = text.match(pairedCardRegex);
-
-                let value = null;
-                let rawSuit = null;
-
-                if (pairedMatch) {
-                    value = pairedMatch[1];
-                    rawSuit = pairedMatch[2];
-                    remainingText = text.replace(pairedMatch[0], ' ');
-                } else {
-                    const suitMatch = text.match(/\b(clubs?|clovers?|flowers?|hearts?|spades?|diamonds?)\b/);
-                    const valueMatch = text.match(/\b(ace|jack|queen|king|10|[2-9])\b/);
-                    if (suitMatch && valueMatch) {
-                        value = valueMatch[1];
-                        rawSuit = suitMatch[1];
-                        remainingText = text.replace(valueMatch[0], ' ').replace(suitMatch[0], ' ');
-                    }
-                }
-
-                if (value && rawSuit) {
-                    let suit = rawSuit;
-                    if (suit.startsWith('club') || suit.startsWith('clover') || suit.startsWith('flower')) suit = 'clubs';
-                    else if (suit.startsWith('heart')) suit = 'hearts';
-                    else if (suit.startsWith('spade')) suit = 'spades';
-                    else if (suit.startsWith('diamond')) suit = 'diamonds';
-
-                    const candidate = `${value} of ${suit}`;
-                    if (stack.indexOf(candidate) !== -1) {
-                        detectedCard = candidate;
-                    }
-                }
-            }
-
-            const numbersFound = remainingText.match(/\b([1-9]|[1-4][0-9]|5[0-2])\b/g);
-            const detectedPosition = (numbersFound && numbersFound.length > 0)
-                ? parseInt(numbersFound[numbersFound.length - 1], 10)
-                : null;
-
-            return {
-                card: detectedCard,
-                position: detectedPosition,
-                partialCardAttempt: (hasSuitKeyword || hasFaceKeyword) && !detectedCard
-            };
-        }
-
-        function processSpeechInput(rawText) {
-            const { card, position, partialCardAttempt } = extractElements(rawText);
-
-            // CASE 1: Both Card and Position spoken together
-            if (card && position) {
-                clearTimeout(pendingCardTimer);
-                pendingCard = null;
-                executeCalculation(card, position);
-                return;
-            }
-
-            // CASE 2: Only Card spoken (e.g. "King of Clubs") — Lock card & wait for position number!
-            if (card && !position) {
-                pendingCard = card;
-                const formatted = card.replace(/\b\w/g, c => c.toUpperCase());
-                debugEl.innerText = `Locked: ${formatted} — Say position number...`;
-                
-                clearTimeout(pendingCardTimer);
-                pendingCardTimer = setTimeout(() => {
-                    if (pendingCard) {
-                        pendingCard = null;
-                        debugEl.innerText = `Timed out waiting for position.`;
-                        speakResult("Repeat.");
-                    }
-                }, 10000); // Wait up to 10 seconds for the position number
-
-                resetToListening();
-                return;
-            }
-
-            // CASE 3: Position spoken right after a Card was locked in memory!
-            if (!card && position && pendingCard) {
-                const lockedCard = pendingCard;
-                pendingCard = null;
-                clearTimeout(pendingCardTimer);
-                executeCalculation(lockedCard, position);
-                return;
-            }
-
-            // CASE 4: Tried to say a card (e.g. "Spades 36") but missed the card value
-            if (partialCardAttempt) {
-                debugEl.innerText = `Missed card value: "${rawText}"`;
-                speakResult("Repeat.");
-                return;
-            }
-
-            // CASE 5: Normal conversation chatter — Ignore silently
-            debugEl.innerText = pendingCard
-                ? `Locked: ${pendingCard.toUpperCase()} — Waiting for number...`
-                : `Ignored chatter: "${rawText}"`;
-            resetToListening();
-        }
-
-        function executeCalculation(card, targetPosition) {
-            const cardIndex = stack.indexOf(card);
-            const currentPosition = cardIndex + 1; 
-            const formattedHeardCard = card.replace(/\b\w/g, c => c.toUpperCase());
-
-            let cutAmount = currentPosition - targetPosition;
-            if (cutAmount < 0) cutAmount += 52;
-
-            if (cutAmount === 0) {
-                debugEl.innerText = `${formattedHeardCard} at ${targetPosition}`;
-                resultEl.innerText = `Cut 0 (${formattedHeardCard})`;
-                resultEl.style.display = 'block';
-                speakResult(`${formattedHeardCard}, ${targetPosition}. Cut zero.`);
-                return;
-            }
-
-            const bottomCardIndex = (cutAmount - 1 + 52) % 52;
-            const bottomCard = stack[bottomCardIndex];
-            const formattedBottom = bottomCard.replace(/\b\w/g, c => c.toUpperCase());
-            
-            const outputText = `${formattedHeardCard}, ${targetPosition}. Cut ${cutAmount}, ${formattedBottom}.`;
-
-            debugEl.innerText = `${formattedHeardCard} at ${targetPosition}`;
-            resultEl.innerText = `Cut ${cutAmount} (${formattedBottom})`;
-            resultEl.style.display = 'block';
-
-            speakResult(outputText);
-        }
-
-        async function speakResult(text) {
-            isSpeaking = true;
-            statusEl.innerText = "Speaking...";
-            statusEl.style.color = "#9d84ff"; 
-
-            speechFailSafeTimeout = setTimeout(() => {
-                resetToListening();
-            }, 7000);
-
-            try {
-                const res = await fetch('/api/transcribe', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ action: 'tts', text: text })
-                });
-                const data = await res.json();
-
-                if (data.audio && audioContext) {
-                    if (audioContext.state !== 'running') {
-                        await audioContext.resume().catch(() => {});
-                    }
-
-                    const binaryString = window.atob(data.audio);
-                    const len = binaryString.length;
-                    const bytes = new Uint8Array(len);
-                    for (let i = 0; i < len; i++) {
-                        bytes[i] = binaryString.charCodeAt(i);
-                    }
-
-                    audioContext.decodeAudioData(
-                        bytes.buffer,
-                        (decodedBuffer) => {
-                            const bufferSource = audioContext.createBufferSource();
-                            bufferSource.buffer = decodedBuffer;
-                            bufferSource.connect(audioContext.destination);
-                            bufferSource.onended = () => {
-                                setTimeout(resetToListening, 350);
-                            };
-                            bufferSource.start(0);
-                        },
-                        () => {
-                            resetToListening();
-                        }
-                    );
-                } else {
-                    resetToListening();
-                }
-            } catch (e) {
-                resetToListening();
-            }
-        }
     </script>
 </body>
 </html>
