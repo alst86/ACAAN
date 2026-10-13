@@ -22,8 +22,8 @@
         }
         h1 { color: #9d84ff; font-size: 2rem; margin-bottom: 10px; }
         #status { font-size: 1.2rem; margin-top: 20px; color: #a0a5b5; transition: color 0.3s; }
-        #debug { font-size: 0.9rem; margin-top: 10px; color: #555; font-style: italic; min-height: 20px; padding: 0 20px; }
-        #result { font-size: 1.5rem; margin-top: 30px; font-weight: bold; color: #ffffff; padding: 20px; border-radius: 10px; background: #232533; display: none; width: 80%; }
+        #debug { font-size: 0.9rem; margin-top: 10px; color: #777; font-style: italic; min-height: 24px; padding: 0 20px; }
+        #result { font-size: 1.4rem; margin-top: 30px; font-weight: bold; color: #ffffff; padding: 20px; border-radius: 10px; background: #232533; display: none; width: 80%; }
         #app-content { display: flex; flex-direction: column; align-items: center; width: 100%; }
     </style>
 </head>
@@ -32,11 +32,10 @@
     <div id="app-content">
         <h1>ACAAN</h1>
         <div id="status">Initializing...</div>
-        <div id="debug">Tap screen once to unlock earpiece audio</div>
+        <div id="debug">Tap anywhere once to prime earpiece</div>
         <div id="result"></div>
     </div>
 
-    <!-- Standard HTML5 Audio Player for Bluetooth Earpiece Routing -->
     <audio id="audioPlayer" playsinline></audio>
 
     <script>
@@ -55,7 +54,7 @@
         const audioPlayer = document.getElementById('audioPlayer');
 
         let isSpeaking = false;
-        let voiceUnlocked = false;
+        let audioUnlocked = false;
         let speechFailSafeTimeout = null;
         
         let audioContext = null;
@@ -68,16 +67,15 @@
         let dataArray = null;
         let animationFrameId = null;
 
-        // Unlock HTML5 Audio Player on first screen touch
         document.body.addEventListener('touchstart', () => {
-            if (!voiceUnlocked) {
+            if (!audioUnlocked) {
                 audioPlayer.src = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA";
                 audioPlayer.play().catch(() => {});
                 if (audioContext && audioContext.state === 'suspended') {
                     audioContext.resume();
                 }
-                voiceUnlocked = true;
-                debugEl.innerText = "(Audio Unlocked) Ready";
+                audioUnlocked = true;
+                debugEl.innerText = "Earpiece ready. Speak card and position.";
             }
         });
 
@@ -119,19 +117,18 @@
                             const data = await res.json();
                             
                             if (data.error) {
-                                debugEl.innerText = `API Error: ${data.error}`;
+                                debugEl.innerText = `Error: ${data.error}`;
                                 resetToListening();
                                 return;
                             }
                             
                             if (data.text) {
-                                debugEl.innerText = `AI Heard: "${data.text}"`;
-                                processInput(data.text);
+                                processSpeechInput(data.text);
                             } else {
                                 resetToListening();
                             }
                         } catch (e) {
-                            debugEl.innerText = "Error reaching AI Server.";
+                            debugEl.innerText = "Connection error.";
                             resetToListening();
                         }
                     };
@@ -141,7 +138,7 @@
                 monitorAudioLevel();
 
             } catch (err) {
-                statusEl.innerText = "Mic Permission Denied.";
+                statusEl.innerText = "Mic Permission Denied";
             }
         }
 
@@ -172,7 +169,7 @@
             clearTimeout(speechFailSafeTimeout);
             isRecording = false;
             isSpeaking = false;
-            statusEl.innerText = "Paused...";
+            statusEl.innerText = "Paused";
         }
 
         window.addEventListener('load', startListening);
@@ -222,102 +219,105 @@
             animationFrameId = requestAnimationFrame(monitorAudioLevel);
         }
 
-        function getEditDistance(a, b) {
-            if (a.length === 0) return b.length;
-            if (b.length === 0) return a.length;
-            const matrix = Array.from({ length: a.length + 1 }, (_, i) => [i]);
-            for (let j = 0; j <= b.length; j++) matrix[0][j] = j;
-            for (let i = 1; i <= a.length; i++) {
-                for (let j = 1; j <= b.length; j++) {
-                    if (a[i - 1] === b[j - 1]) matrix[i][j] = matrix[i - 1][j - 1];
-                    else matrix[i][j] = Math.min(matrix[i - 1][j - 1], matrix[i][j - 1], matrix[i - 1][j]) + 1;
-                }
+        // --- STRICT CARD, SUIT & POSITION VALIDATION ---
+        function parseCardAndPosition(rawText) {
+            // Discard common Whisper silence hallucinations
+            if (/thank you for|watching|joining|subtitles/i.test(rawText)) {
+                return null;
             }
-            return matrix[a.length][b.length];
+
+            let text = rawText.toLowerCase().replace(/[.,!?]/g, ' ').replace(/\s+/g, ' ').trim();
+
+            // Normalize word numbers up to 52 for SG/MY speech
+            const wordToNum = {
+                'one': '1', 'two': '2', 'three': '3', 'tree': '3', 'four': '4', 'for': '4', 'ford': '4',
+                'five': '5', 'six': '6', 'seven': '7', 'eight': '8', 'ate': '8', 'nine': '9', 'ten': '10',
+                'eleven': '11', 'twelve': '12', 'thirteen': '13', 'fourteen': '14', 'fifteen': '15',
+                'sixteen': '16', 'seventeen': '17', 'eighteen': '18', 'nineteen': '19', 'twenty': '20',
+                'thirty': '30', 'forty': '40', 'fifty': '50'
+            };
+
+            for (const [w, n] of Object.entries(wordToNum)) {
+                text = text.replace(new RegExp(`\\b${w}\\b`, 'g'), n);
+            }
+            // Compound numbers like "20 5" -> "25"
+            text = text.replace(/\b(20|30|40|50)\s+([1-9])\b/g, (m, tens, ones) => String(parseInt(tens) + parseInt(ones)));
+
+            // 1. Identify Suit (including SG/MY terms "clover" and "flower" for clubs)
+            const suitMatch = text.match(/\b(clubs?|clovers?|flowers?|hearts?|spades?|diamonds?)\b/);
+            if (!suitMatch) return null; // No suit = DO NOT OUTPUT
+
+            let suit = suitMatch[1];
+            if (suit.startsWith('club') || suit.startsWith('clover') || suit.startsWith('flower')) suit = 'clubs';
+            else if (suit.startsWith('heart')) suit = 'hearts';
+            else if (suit.startsWith('spade')) suit = 'spades';
+            else if (suit.startsWith('diamond')) suit = 'diamonds';
+
+            // 2. Identify Card Value (Ace, 2-10, Jack, Queen, King)
+            // Look for card value near the suit or in phrase
+            const valueMatch = text.match(/\b(ace|jack|queen|king|10|[2-9])\b/);
+            if (!valueMatch) return null; // No card value = DO NOT OUTPUT
+
+            let value = valueMatch[1];
+            const targetCard = `${value} of ${suit}`;
+
+            // Ensure card is in deck
+            const cardIndex = stack.indexOf(targetCard);
+            if (cardIndex === -1) return null;
+
+            // 3. Identify Target Position (1 to 52)
+            // Remove the card components from text so the card value doesn't conflict with position
+            let remainingText = text.replace(valueMatch[0], ' ').replace(suitMatch[0], ' ');
+            
+            const numbersFound = remainingText.match(/\b([1-9]|[1-4][0-9]|5[0-2])\b/g);
+            if (!numbersFound || numbersFound.length === 0) return null; // No position = DO NOT OUTPUT
+
+            // Take the position number
+            const targetPosition = parseInt(numbersFound[numbersFound.length - 1], 10);
+
+            return {
+                card: targetCard,
+                cardIndex: cardIndex,
+                position: targetPosition
+            };
         }
 
-        function findBestCardMatch(text) {
-            let bestMatch = null;
-            let bestScore = Infinity;
-            let bestIndex = -1;
-            const words = text.split(" ");
-            
-            for (let i = 0; i < stack.length; i++) {
-                const card = stack[i];
-                const cardWordCount = card.split(" ").length;
-                
-                if (words.length <= cardWordCount) {
-                    const distance = getEditDistance(text, card);
-                    if (distance < bestScore) {
-                        bestScore = distance;
-                        bestMatch = card;
-                        bestIndex = i;
-                    }
-                    continue;
-                }
+        function processSpeechInput(rawText) {
+            const parsed = parseCardAndPosition(rawText);
 
-                for (let j = 0; j <= words.length - cardWordCount; j++) {
-                    const snippet = words.slice(j, j + cardWordCount).join(" ");
-                    const distance = getEditDistance(snippet, card);
-                    if (distance < bestScore) {
-                        bestScore = distance;
-                        bestMatch = card;
-                        bestIndex = i;
-                    }
-                }
-            }
-            return bestScore <= 7 ? { card: bestMatch, index: bestIndex } : null;
-        }
-
-        function processInput(text) {
-            let processedText = text.toLowerCase()
-                                    .replace(/[.,!?]/g, '')
-                                    .replace(/\b(at|to|number|position|cut|for|the)\b/g, '')
-                                    .replace(/\bone\b/g, "1").replace(/\btwo\b/g, "2").replace(/\bthree\b/g, "3")
-                                    .replace(/\bfour\b/g, "4").replace(/\bfive\b/g, "5").replace(/\bsix\b/g, "6")
-                                    .replace(/\bseven\b/g, "7").replace(/\beight\b/g, "8").replace(/\bnine\b/g, "9")
-                                    .replace(/\bten\b/g, "10")
-                                    .replace(/\s+/g, " ").trim();
-
-            const numbers = processedText.match(/\b([1-9]|[1-4][0-9]|5[0-2])\b/g);
-            
-            if (numbers && numbers.length > 0) {
-                const targetPositionStr = numbers[numbers.length - 1];
-                const targetPosition = parseInt(targetPositionStr, 10);
-                
-                const lastIndex = processedText.lastIndexOf(targetPositionStr);
-                let textWithoutPosition = processedText;
-                if (lastIndex !== -1) {
-                    textWithoutPosition = processedText.substring(0, lastIndex) + processedText.substring(lastIndex + targetPositionStr.length);
-                }
-
-                const matchResult = findBestCardMatch(textWithoutPosition.trim());
-                
-                if (matchResult) {
-                    const currentPosition = matchResult.index + 1; 
-
-                    let cutAmount = currentPosition - targetPosition;
-                    if (cutAmount < 0) cutAmount += 52;
-                    if (cutAmount === 0) {
-                        resetToListening();
-                        return; 
-                    }
-
-                    const bottomCardIndex = (cutAmount - 1 + 52) % 52;
-                    const bottomCard = stack[bottomCardIndex];
-                    const formattedCard = bottomCard.replace(/\b\w/g, c => c.toUpperCase());
-                    const outputText = `Cut ${cutAmount} cards, ${formattedCard}.`;
-
-                    resultEl.innerText = `Cut ${cutAmount} cards (${formattedCard}).`;
-                    resultEl.style.display = 'block';
-
-                    speakResult(outputText);
-                } else {
-                    resetToListening();
-                }
-            } else {
+            if (!parsed) {
+                // Incomplete input: keep old results hidden, display what was heard
+                resultEl.style.display = 'none';
+                debugEl.innerText = `Heard: "${rawText}" (Need card value, suit & number)`;
                 resetToListening();
+                return;
             }
+
+            // All 3 validated: Card Value, Suit, and Position (1-52)
+            const currentPosition = parsed.cardIndex + 1; // 1-indexed in stack
+            const targetPosition = parsed.position;
+
+            let cutAmount = currentPosition - targetPosition;
+            if (cutAmount < 0) cutAmount += 52;
+
+            if (cutAmount === 0) {
+                debugEl.innerText = `Heard: ${parsed.card} at ${targetPosition}`;
+                resultEl.innerText = "Card already at position. Cut 0.";
+                resultEl.style.display = 'block';
+                speakResult("Card is already at target position.");
+                return;
+            }
+
+            const bottomCardIndex = (cutAmount - 1 + 52) % 52;
+            const bottomCard = stack[bottomCardIndex];
+            const formattedBottom = bottomCard.replace(/\b\w/g, c => c.toUpperCase());
+            const outputText = `Cut ${cutAmount} cards, ${formattedBottom}.`;
+
+            debugEl.innerText = `Heard: ${parsed.card} at position ${targetPosition}`;
+            resultEl.innerText = `Cut ${cutAmount} cards (${formattedBottom}).`;
+            resultEl.style.display = 'block';
+
+            speakResult(outputText);
         }
 
         async function speakResult(text) {
@@ -325,12 +325,10 @@
             statusEl.innerText = "Speaking...";
             statusEl.style.color = "#9d84ff"; 
 
-            // Mute mic track during playback so Bluetooth audio doesn't conflict
             if (audioStream) {
                 audioStream.getAudioTracks().forEach(t => t.enabled = false);
             }
 
-            // Fail-safe timer so it can never freeze on "Speaking..."
             speechFailSafeTimeout = setTimeout(() => {
                 resetToListening();
             }, 6000);
