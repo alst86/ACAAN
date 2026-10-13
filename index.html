@@ -32,9 +32,12 @@
     <div id="app-content">
         <h1>ACAAN</h1>
         <div id="status">Initializing...</div>
-        <div id="debug">Tap anywhere to unlock voice</div>
+        <div id="debug">Tap screen once to unlock earpiece audio</div>
         <div id="result"></div>
     </div>
+
+    <!-- Standard HTML5 Audio Player for Bluetooth Earpiece Routing -->
+    <audio id="audioPlayer" playsinline></audio>
 
     <script>
         const stack = [
@@ -49,10 +52,11 @@
         const statusEl = document.getElementById('status');
         const debugEl = document.getElementById('debug');
         const resultEl = document.getElementById('result');
+        const audioPlayer = document.getElementById('audioPlayer');
 
         let isSpeaking = false;
-        let selectedVoice = null;
         let voiceUnlocked = false;
+        let speechFailSafeTimeout = null;
         
         let audioContext = null;
         let mediaRecorder = null;
@@ -63,26 +67,17 @@
         let analyser = null;
         let dataArray = null;
         let animationFrameId = null;
-        
-        function loadVoices() {
-            const voices = window.speechSynthesis.getVoices();
-            if (voices.length > 0) {
-                selectedVoice = voices.find(voice => voice.lang.includes('en')) || voices[0];
-            }
-        }
-        window.speechSynthesis.onvoiceschanged = loadVoices;
 
+        // Unlock HTML5 Audio Player on first screen touch
         document.body.addEventListener('touchstart', () => {
             if (!voiceUnlocked) {
-                loadVoices();
-                if ('speechSynthesis' in window) {
-                    window.speechSynthesis.resume();
-                    const unlock = new SpeechSynthesisUtterance(' ');
-                    unlock.volume = 0.01;
-                    window.speechSynthesis.speak(unlock);
+                audioPlayer.src = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA";
+                audioPlayer.play().catch(() => {});
+                if (audioContext && audioContext.state === 'suspended') {
+                    audioContext.resume();
                 }
                 voiceUnlocked = true;
-                debugEl.innerText = "";
+                debugEl.innerText = "(Audio Unlocked) Ready";
             }
         });
 
@@ -110,7 +105,6 @@
                     statusEl.innerText = "Analyzing...";
                     statusEl.style.color = "#ffb86c"; 
                     
-                    // Convert to Base64 to safely bypass Vercel parsing errors
                     const reader = new FileReader();
                     reader.readAsDataURL(audioBlob);
                     reader.onloadend = async () => {
@@ -152,10 +146,13 @@
         }
 
         function resetToListening() {
-            if (!isSpeaking) {
-                statusEl.innerText = "Listening...";
-                statusEl.style.color = "#a0a5b5";
+            isSpeaking = false;
+            clearTimeout(speechFailSafeTimeout);
+            if (audioStream) {
+                audioStream.getAudioTracks().forEach(t => t.enabled = true);
             }
+            statusEl.innerText = "Listening...";
+            statusEl.style.color = "#a0a5b5";
         }
 
         function stopListening() {
@@ -172,7 +169,9 @@
                 audioContext = null;
             }
             clearTimeout(silenceTimer);
+            clearTimeout(speechFailSafeTimeout);
             isRecording = false;
+            isSpeaking = false;
             statusEl.innerText = "Paused...";
         }
 
@@ -271,7 +270,9 @@
         }
 
         function processInput(text) {
-            let processedText = text.replace(/\b(at|to|number|position|cut|for|the)\b/g, '')
+            let processedText = text.toLowerCase()
+                                    .replace(/[.,!?]/g, '')
+                                    .replace(/\b(at|to|number|position|cut|for|the)\b/g, '')
                                     .replace(/\bone\b/g, "1").replace(/\btwo\b/g, "2").replace(/\bthree\b/g, "3")
                                     .replace(/\bfour\b/g, "4").replace(/\bfive\b/g, "5").replace(/\bsix\b/g, "6")
                                     .replace(/\bseven\b/g, "7").replace(/\beight\b/g, "8").replace(/\bnine\b/g, "9")
@@ -305,42 +306,54 @@
                     const bottomCardIndex = (cutAmount - 1 + 52) % 52;
                     const bottomCard = stack[bottomCardIndex];
                     const formattedCard = bottomCard.replace(/\b\w/g, c => c.toUpperCase());
-                    const outputText = `Cut ${cutAmount} cards (${formattedCard}).`;
+                    const outputText = `Cut ${cutAmount} cards, ${formattedCard}.`;
 
-                    resultEl.innerText = outputText;
+                    resultEl.innerText = `Cut ${cutAmount} cards (${formattedCard}).`;
                     resultEl.style.display = 'block';
 
                     speakResult(outputText);
+                } else {
+                    resetToListening();
                 }
             } else {
                 resetToListening();
             }
         }
 
-        function speakResult(text) {
+        async function speakResult(text) {
             isSpeaking = true;
             statusEl.innerText = "Speaking...";
             statusEl.style.color = "#9d84ff"; 
-            
-            setTimeout(() => {
-                window.speechSynthesis.cancel();
-                
-                const utterance = new SpeechSynthesisUtterance(text);
-                utterance.rate = 1.0;
-                if (selectedVoice) utterance.voice = selectedVoice;
 
-                utterance.onend = () => {
-                    isSpeaking = false;
+            // Mute mic track during playback so Bluetooth audio doesn't conflict
+            if (audioStream) {
+                audioStream.getAudioTracks().forEach(t => t.enabled = false);
+            }
+
+            // Fail-safe timer so it can never freeze on "Speaking..."
+            speechFailSafeTimeout = setTimeout(() => {
+                resetToListening();
+            }, 6000);
+
+            try {
+                const res = await fetch('/api/transcribe', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ action: 'tts', text: text })
+                });
+                const data = await res.json();
+
+                if (data.audio) {
+                    audioPlayer.src = `data:audio/mp3;base64,${data.audio}`;
+                    audioPlayer.onended = () => resetToListening();
+                    audioPlayer.onerror = () => resetToListening();
+                    await audioPlayer.play();
+                } else {
                     resetToListening();
-                };
-
-                utterance.onerror = () => {
-                    isSpeaking = false;
-                    resetToListening();
-                };
-
-                window.speechSynthesis.speak(utterance);
-            }, 200);
+                }
+            } catch (e) {
+                resetToListening();
+            }
         }
     </script>
 </body>
