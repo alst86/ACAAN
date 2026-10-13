@@ -4,7 +4,7 @@ export default async function handler(req, res) {
     }
     
     try {
-        // MODE 1: Text-to-Speech (Audio output to earpiece)
+        // MODE 1: Text-to-Speech (Earpiece Output)
         if (req.body.action === 'tts') {
             const ttsResponse = await fetch('https://api.openai.com/v1/audio/speech', {
                 method: 'POST',
@@ -17,7 +17,7 @@ export default async function handler(req, res) {
                     input: req.body.text,
                     voice: 'onyx',
                     response_format: 'mp3',
-                    speed: 1.05
+                    speed: 1.08
                 })
             });
 
@@ -31,21 +31,25 @@ export default async function handler(req, res) {
             return res.status(200).json({ audio: base64Audio });
         }
 
-        // MODE 2: Speech-to-Text (Whisper configured for SG/MY English)
+        // MODE 2: Speech-to-Text (Whisper)
         const base64Audio = req.body.audio;
         if (!base64Audio) {
             return res.status(400).json({ error: "No audio received" });
         }
         
         const audioBuffer = Buffer.from(base64Audio, 'base64');
-        const audioBlob = new Blob([audioBuffer], { type: 'audio/mp4' });
+        // Auto-detect WAV header ('UklGR' in base64 = 'RIFF')
+        const isWav = base64Audio.startsWith('UklGR');
+        const mimeType = isWav ? 'audio/wav' : 'audio/mp4';
+        const fileName = isWav ? 'audio.wav' : 'audio.mp4';
+
+        const audioBlob = new Blob([audioBuffer], { type: mimeType });
         
         const formData = new FormData();
-        formData.append('file', audioBlob, 'audio.mp4');
+        formData.append('file', audioBlob, fileName);
         formData.append('model', 'whisper-1');
         formData.append('language', 'en');
-        formData.append('temperature', '0'); // Kills hallucinations like "Thank you for watching/joining"
-        // Prompt tuned for Singapore/Malaysia English and card magic terms
+        formData.append('temperature', '0');
         formData.append('prompt', 'Singapore and Malaysia English ACAAN trick. Ace, 2, two, 3, three, 4, four, 5, five, 6, six, 7, seven, 8, eight, 9, nine, 10, ten, Jack, Queen, King of Clubs, Clovers, Flowers, Hearts, Spades, Diamonds. Position number 1 to 52.');
         
         const aiResponse = await fetch('https://api.openai.com/v1/audio/transcriptions', {
