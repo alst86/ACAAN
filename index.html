@@ -56,52 +56,51 @@
         let audioContext = null;
         let mediaRecorder = null;
         let audioStream = null;
-        let sourceNode = null;
         let audioChunks = [];
         let isRecording = false;
         let silenceTimer = null;
         let maxRecordTimer = null;
         let analyser = null;
-        let dataArray = null;
+        let timeDomainArray = null;
         let animationFrameId = null;
-        let zeroFramesCount = 0;
 
-        // Safely wake AudioContext on any touch without using a separate <audio> tag
-        function wakeAudioEngine() {
-            if (audioContext && audioContext.state !== 'running') {
+        // Synchronously unlock WebAudio on touch without using an <audio> tag
+        function unlockAudioContext() {
+            if (!audioContext) return;
+            if (audioContext.state !== 'running') {
                 audioContext.resume().catch(() => {});
             }
-        }
-        document.body.addEventListener('touchend', wakeAudioEngine);
-        document.body.addEventListener('click', wakeAudioEngine);
-
-        function setupAudioAnalyser() {
-            if (!audioStream) return;
             try {
-                if (!audioContext || audioContext.state === 'closed') {
-                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                }
-                if (audioContext.state !== 'running') {
-                    audioContext.resume().catch(() => {});
-                }
-                if (sourceNode) {
-                    try { sourceNode.disconnect(); } catch (e) {}
-                }
-                sourceNode = audioContext.createMediaStreamSource(audioStream);
-                analyser = audioContext.createAnalyser();
-                analyser.fftSize = 512;
-                sourceNode.connect(analyser);
-                dataArray = new Uint8Array(analyser.frequencyBinCount);
-                zeroFramesCount = 0;
+                const buffer = audioContext.createBuffer(1, 1, 22050);
+                const source = audioContext.createBufferSource();
+                source.buffer = buffer;
+                source.connect(audioContext.destination);
+                source.start(0);
             } catch (e) {}
         }
+        document.body.addEventListener('touchstart', unlockAudioContext, { passive: true });
+        document.body.addEventListener('touchend', unlockAudioContext, { passive: true });
+        document.body.addEventListener('click', unlockAudioContext);
 
         async function startListening() {
             if (audioStream) return; 
 
             try {
                 audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                setupAudioAnalyser();
+                
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                const sourceNode = audioContext.createMediaStreamSource(audioStream);
+                analyser = audioContext.createAnalyser();
+                analyser.fftSize = 512;
+
+                // Connect through a zero-gain node to destination so iOS WebKit continuously pulls mic data
+                const silentGain = audioContext.createGain();
+                silentGain.gain.value = 0;
+                sourceNode.connect(analyser);
+                analyser.connect(silentGain);
+                silentGain.connect(audioContext.destination);
+
+                timeDomainArray = new Uint8Array(analyser.fftSize);
 
                 mediaRecorder = new MediaRecorder(audioStream);
                 mediaRecorder.ondataavailable = e => { if (e.data.size > 0) audioChunks.push(e.data); };
@@ -204,9 +203,11 @@
         function monitorAudioLevel() {
             if (!analyser || !audioStream) return;
 
-            // Catch both 'suspended' and iOS 'interrupted' states
             if (audioContext && audioContext.state !== 'running') {
-                audioContext.resume().catch(() => {});
+                statusEl.innerText = "Tap screen once to wake mic";
+                statusEl.style.color = "#ffb86c";
+                animationFrameId = requestAnimationFrame(monitorAudioLevel);
+                return;
             }
 
             if (isSpeaking) {
@@ -214,30 +215,22 @@
                 return;
             }
 
-            analyser.getByteFrequencyData(dataArray);
-            let sum = 0;
-            for (let i = 0; i < dataArray.length; i++) {
-                sum += dataArray[i];
-            }
-            let average = Math.round(sum / dataArray.length);
-
-            // Auto-heal watchdog if iOS ever zeroes out the audio graph
-            if (average === 0) {
-                zeroFramesCount++;
-                if (zeroFramesCount > 120) {
-                    setupAudioAnalyser();
-                }
-            } else {
-                zeroFramesCount = 0;
+            // Measure raw voice waveform peak (works accurately with narrowband Bluetooth mics)
+            analyser.getByteTimeDomainData(timeDomainArray);
+            let maxPeak = 0;
+            for (let i = 0; i < timeDomainArray.length; i++) {
+                const deviation = Math.abs(timeDomainArray[i] - 128);
+                if (deviation > maxPeak) maxPeak = deviation;
             }
 
-            const SPEECH_THRESHOLD = 9; 
+            const SPEECH_THRESHOLD = 8; 
 
-            if (!isRecording && statusEl.innerText.startsWith("Listening")) {
-                statusEl.innerText = `Listening... (${average})`;
+            if (!isRecording) {
+                statusEl.innerText = `Listening... (${maxPeak})`;
+                statusEl.style.color = "#a0a5b5";
             }
 
-            if (average > SPEECH_THRESHOLD) {
+            if (maxPeak > SPEECH_THRESHOLD) {
                 if (!isRecording && mediaRecorder && mediaRecorder.state === 'inactive') {
                     isRecording = true;
                     mediaRecorder.start();
@@ -393,7 +386,6 @@
             speakResult(outputText);
         }
 
-        // Plays TTS directly through WebAudio so iOS never interrupts the microphone
         async function speakResult(text) {
             isSpeaking = true;
             statusEl.innerText = "Speaking...";
@@ -430,8 +422,7 @@
                             bufferSource.buffer = decodedBuffer;
                             bufferSource.connect(audioContext.destination);
                             bufferSource.onended = () => {
-                                // Brief 300ms pause so mic doesn't catch trailing echo
-                                setTimeout(resetToListening, 300);
+                                setTimeout(resetToListening, 350);
                             };
                             bufferSource.start(0);
                         },
