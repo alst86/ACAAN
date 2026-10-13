@@ -32,11 +32,9 @@
     <div id="app-content">
         <h1>ACAAN</h1>
         <div id="status">Initializing...</div>
-        <div id="debug">Tap anywhere once to prime earpiece</div>
+        <div id="debug">Speak card and position</div>
         <div id="result"></div>
     </div>
-
-    <audio id="audioPlayer" playsinline></audio>
 
     <script>
         const stack = [
@@ -51,15 +49,14 @@
         const statusEl = document.getElementById('status');
         const debugEl = document.getElementById('debug');
         const resultEl = document.getElementById('result');
-        const audioPlayer = document.getElementById('audioPlayer');
 
         let isSpeaking = false;
-        let audioUnlocked = false;
         let speechFailSafeTimeout = null;
         
         let audioContext = null;
         let mediaRecorder = null;
         let audioStream = null;
+        let sourceNode = null;
         let audioChunks = [];
         let isRecording = false;
         let silenceTimer = null;
@@ -67,38 +64,44 @@
         let analyser = null;
         let dataArray = null;
         let animationFrameId = null;
+        let zeroFramesCount = 0;
 
-        // Unlock earpiece audio AND force the mic analyser to wake up
-        document.body.addEventListener('touchstart', async () => {
-            if (audioContext && audioContext.state === 'suspended') {
-                try { await audioContext.resume(); } catch (e) {}
+        // Safely wake AudioContext on any touch without using a separate <audio> tag
+        function wakeAudioEngine() {
+            if (audioContext && audioContext.state !== 'running') {
+                audioContext.resume().catch(() => {});
             }
-            if (!audioUnlocked) {
-                audioUnlocked = true;
-                audioPlayer.src = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA";
-                try {
-                    await audioPlayer.play();
-                } catch (e) {}
-                if (audioContext && audioContext.state === 'suspended') {
-                    try { await audioContext.resume(); } catch (e) {}
+        }
+        document.body.addEventListener('touchend', wakeAudioEngine);
+        document.body.addEventListener('click', wakeAudioEngine);
+
+        function setupAudioAnalyser() {
+            if (!audioStream) return;
+            try {
+                if (!audioContext || audioContext.state === 'closed') {
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
                 }
-                debugEl.innerText = "Earpiece ready. Speak card & position.";
-            }
-        });
+                if (audioContext.state !== 'running') {
+                    audioContext.resume().catch(() => {});
+                }
+                if (sourceNode) {
+                    try { sourceNode.disconnect(); } catch (e) {}
+                }
+                sourceNode = audioContext.createMediaStreamSource(audioStream);
+                analyser = audioContext.createAnalyser();
+                analyser.fftSize = 512;
+                sourceNode.connect(analyser);
+                dataArray = new Uint8Array(analyser.frequencyBinCount);
+                zeroFramesCount = 0;
+            } catch (e) {}
+        }
 
         async function startListening() {
             if (audioStream) return; 
 
             try {
-                // Raw audio stream for maximum Bluetooth earpiece sensitivity
                 audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                
-                audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                const source = audioContext.createMediaStreamSource(audioStream);
-                analyser = audioContext.createAnalyser();
-                analyser.fftSize = 512;
-                source.connect(analyser);
-                dataArray = new Uint8Array(analyser.frequencyBinCount);
+                setupAudioAnalyser();
 
                 mediaRecorder = new MediaRecorder(audioStream);
                 mediaRecorder.ondataavailable = e => { if (e.data.size > 0) audioChunks.push(e.data); };
@@ -160,10 +163,7 @@
         function resetToListening() {
             isSpeaking = false;
             clearTimeout(speechFailSafeTimeout);
-            if (audioStream) {
-                audioStream.getAudioTracks().forEach(t => t.enabled = true);
-            }
-            if (audioContext && audioContext.state === 'suspended') {
+            if (audioContext && audioContext.state !== 'running') {
                 audioContext.resume().catch(() => {});
             }
             statusEl.innerText = "Listening...";
@@ -180,7 +180,7 @@
                 audioStream = null;
             }
             if (audioContext) {
-                audioContext.close();
+                audioContext.close().catch(() => {});
                 audioContext = null;
             }
             clearTimeout(silenceTimer);
@@ -204,8 +204,8 @@
         function monitorAudioLevel() {
             if (!analyser || !audioStream) return;
 
-            // Keep AudioContext awake if iOS tries to suspend it
-            if (audioContext && audioContext.state === 'suspended') {
+            // Catch both 'suspended' and iOS 'interrupted' states
+            if (audioContext && audioContext.state !== 'running') {
                 audioContext.resume().catch(() => {});
             }
 
@@ -221,6 +221,16 @@
             }
             let average = Math.round(sum / dataArray.length);
 
+            // Auto-heal watchdog if iOS ever zeroes out the audio graph
+            if (average === 0) {
+                zeroFramesCount++;
+                if (zeroFramesCount > 120) {
+                    setupAudioAnalyser();
+                }
+            } else {
+                zeroFramesCount = 0;
+            }
+
             const SPEECH_THRESHOLD = 9; 
 
             if (!isRecording && statusEl.innerText.startsWith("Listening")) {
@@ -234,7 +244,6 @@
                     statusEl.innerText = "Recording...";
                     statusEl.style.color = "#ff5555"; 
 
-                    // In noisy rooms where silence never happens, slice audio after 5s
                     maxRecordTimer = setTimeout(() => {
                         if (isRecording && mediaRecorder && mediaRecorder.state !== 'inactive') {
                             isRecording = false;
@@ -283,7 +292,6 @@
             }
             text = text.replace(/\b(20|30|40|50)\s+([1-9])\b/g, (m, tens, ones) => String(parseInt(tens) + parseInt(ones)));
 
-            // Ignore common patter phrases
             text = text.replace(/\b1\s+(?:2|to)\s+52\b/g, ' ')
                        .replace(/\b52\s+cards?\b/g, ' ');
 
@@ -385,14 +393,11 @@
             speakResult(outputText);
         }
 
+        // Plays TTS directly through WebAudio so iOS never interrupts the microphone
         async function speakResult(text) {
             isSpeaking = true;
             statusEl.innerText = "Speaking...";
             statusEl.style.color = "#9d84ff"; 
-
-            if (audioStream) {
-                audioStream.getAudioTracks().forEach(t => t.enabled = false);
-            }
 
             speechFailSafeTimeout = setTimeout(() => {
                 resetToListening();
@@ -406,11 +411,34 @@
                 });
                 const data = await res.json();
 
-                if (data.audio) {
-                    audioPlayer.src = `data:audio/mp3;base64,${data.audio}`;
-                    audioPlayer.onended = () => resetToListening();
-                    audioPlayer.onerror = () => resetToListening();
-                    await audioPlayer.play();
+                if (data.audio && audioContext) {
+                    if (audioContext.state !== 'running') {
+                        await audioContext.resume().catch(() => {});
+                    }
+
+                    const binaryString = window.atob(data.audio);
+                    const len = binaryString.length;
+                    const bytes = new Uint8Array(len);
+                    for (let i = 0; i < len; i++) {
+                        bytes[i] = binaryString.charCodeAt(i);
+                    }
+
+                    audioContext.decodeAudioData(
+                        bytes.buffer,
+                        (decodedBuffer) => {
+                            const bufferSource = audioContext.createBufferSource();
+                            bufferSource.buffer = decodedBuffer;
+                            bufferSource.connect(audioContext.destination);
+                            bufferSource.onended = () => {
+                                // Brief 300ms pause so mic doesn't catch trailing echo
+                                setTimeout(resetToListening, 300);
+                            };
+                            bufferSource.start(0);
+                        },
+                        () => {
+                            resetToListening();
+                        }
+                    );
                 } else {
                     resetToListening();
                 }
