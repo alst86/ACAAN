@@ -21,7 +21,7 @@
             user-select: none;
         }
         h1 { color: #9d84ff; font-size: 2rem; margin-bottom: 10px; }
-        #status { font-size: 1.2rem; margin-top: 20px; color: #a0a5b5; transition: color 0.3s; }
+        #status { font-size: 1.2rem; margin-top: 20px; color: #a0a5b5; transition: color 0.2s; }
         #debug { font-size: 0.9rem; margin-top: 10px; color: #777; font-style: italic; min-height: 24px; padding: 0 20px; }
         #result { font-size: 1.4rem; margin-top: 30px; font-weight: bold; color: #ffffff; padding: 20px; border-radius: 10px; background: #232533; display: none; width: 80%; }
         #app-content { display: flex; flex-direction: column; align-items: center; width: 100%; }
@@ -68,15 +68,21 @@
         let dataArray = null;
         let animationFrameId = null;
 
-        document.body.addEventListener('touchstart', () => {
+        // Unlock earpiece audio AND force the mic analyser to wake up
+        document.body.addEventListener('touchstart', async () => {
+            if (audioContext && audioContext.state === 'suspended') {
+                try { await audioContext.resume(); } catch (e) {}
+            }
             if (!audioUnlocked) {
-                audioPlayer.src = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA";
-                audioPlayer.play().catch(() => {});
-                if (audioContext && audioContext.state === 'suspended') {
-                    audioContext.resume();
-                }
                 audioUnlocked = true;
-                debugEl.innerText = "Earpiece ready.";
+                audioPlayer.src = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA";
+                try {
+                    await audioPlayer.play();
+                } catch (e) {}
+                if (audioContext && audioContext.state === 'suspended') {
+                    try { await audioContext.resume(); } catch (e) {}
+                }
+                debugEl.innerText = "Earpiece ready. Speak card & position.";
             }
         });
 
@@ -84,14 +90,8 @@
             if (audioStream) return; 
 
             try {
-                // Enable hardware noise suppression & echo cancellation for noisy venues
-                audioStream = await navigator.mediaDevices.getUserMedia({ 
-                    audio: {
-                        echoCancellation: true,
-                        noiseSuppression: true,
-                        autoGainControl: true
-                    } 
-                });
+                // Raw audio stream for maximum Bluetooth earpiece sensitivity
+                audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
                 
                 audioContext = new (window.AudioContext || window.webkitAudioContext)();
                 const source = audioContext.createMediaStreamSource(audioStream);
@@ -108,7 +108,10 @@
                     clearTimeout(maxRecordTimer);
                     isRecording = false;
 
-                    if (audioChunks.length === 0) return;
+                    if (audioChunks.length === 0) {
+                        resetToListening();
+                        return;
+                    }
                     const audioBlob = new Blob(audioChunks, { type: 'audio/mp4' });
                     audioChunks = []; 
                     
@@ -160,6 +163,9 @@
             if (audioStream) {
                 audioStream.getAudioTracks().forEach(t => t.enabled = true);
             }
+            if (audioContext && audioContext.state === 'suspended') {
+                audioContext.resume().catch(() => {});
+            }
             statusEl.innerText = "Listening...";
             statusEl.style.color = "#a0a5b5";
         }
@@ -197,6 +203,12 @@
 
         function monitorAudioLevel() {
             if (!analyser || !audioStream) return;
+
+            // Keep AudioContext awake if iOS tries to suspend it
+            if (audioContext && audioContext.state === 'suspended') {
+                audioContext.resume().catch(() => {});
+            }
+
             if (isSpeaking) {
                 animationFrameId = requestAnimationFrame(monitorAudioLevel);
                 return;
@@ -204,13 +216,16 @@
 
             analyser.getByteFrequencyData(dataArray);
             let sum = 0;
-            for(let i = 0; i < dataArray.length; i++) {
+            for (let i = 0; i < dataArray.length; i++) {
                 sum += dataArray[i];
             }
-            let average = sum / dataArray.length;
+            let average = Math.round(sum / dataArray.length);
 
-            // Balanced threshold for voice over background room noise
-            const SPEECH_THRESHOLD = 14; 
+            const SPEECH_THRESHOLD = 9; 
+
+            if (!isRecording && statusEl.innerText.startsWith("Listening")) {
+                statusEl.innerText = `Listening... (${average})`;
+            }
 
             if (average > SPEECH_THRESHOLD) {
                 if (!isRecording && mediaRecorder && mediaRecorder.state === 'inactive') {
@@ -219,13 +234,13 @@
                     statusEl.innerText = "Recording...";
                     statusEl.style.color = "#ff5555"; 
 
-                    // Safety cap: Force analysis after 6.5s even if room noise never drops to silence
+                    // In noisy rooms where silence never happens, slice audio after 5s
                     maxRecordTimer = setTimeout(() => {
                         if (isRecording && mediaRecorder && mediaRecorder.state !== 'inactive') {
                             isRecording = false;
                             mediaRecorder.stop();
                         }
-                    }, 6500);
+                    }, 5000);
                 }
                 
                 clearTimeout(silenceTimer);
@@ -241,12 +256,12 @@
             animationFrameId = requestAnimationFrame(monitorAudioLevel);
         }
 
-        // --- CONVERSATION-SAFE PARSER ---
         function parseCardAndPosition(rawText) {
             const cleanRaw = rawText.trim();
 
             if (
                 cleanRaw.length < 2 ||
+                /^(you|thank you|thanks|bye|okay|oh|uh|um)$/i.test(cleanRaw) ||
                 /thank you for|watching|joining|subtitles|amara\.org/i.test(cleanRaw)
             ) {
                 return { valid: false, partialCardHeard: false };
@@ -254,7 +269,6 @@
 
             let text = cleanRaw.toLowerCase().replace(/[.,!?-]/g, ' ').replace(/\s+/g, ' ').trim();
 
-            // Convert spoken number words to digits
             const wordToNum = {
                 'one': '1', 'two': '2', 'to': '2', 'too': '2', 'three': '3', 'tree': '3',
                 'four': '4', 'for': '4', 'ford': '4', 'five': '5', 'six': '6', 'seven': '7',
@@ -269,21 +283,17 @@
             }
             text = text.replace(/\b(20|30|40|50)\s+([1-9])\b/g, (m, tens, ones) => String(parseInt(tens) + parseInt(ones)));
 
-            // Strip common magician patter phrases so they don't trigger false numbers
+            // Ignore common patter phrases
             text = text.replace(/\b1\s+(?:2|to)\s+52\b/g, ' ')
                        .replace(/\b52\s+cards?\b/g, ' ');
 
-            // Check if ANY card-related keyword was spoken (to decide whether to say "Repeat" on failure)
             const hasSuitKeyword = /\b(clubs?|clovers?|flowers?|hearts?|spades?|diamonds?)\b/.test(text);
             const hasFaceKeyword = /\b(ace|jack|queen|king)\b/.test(text);
-            const partialCardHeard = hasSuitKeyword || hasFaceKeyword;
 
             if (!hasSuitKeyword) {
-                // Normal conversation without any suit mentioned -> Ignore silently
                 return { valid: false, partialCardHeard: hasFaceKeyword };
             }
 
-            // 1. Lock onto Value + Suit spoken together (e.g., "10 of spades" or "10 spades")
             const pairedCardRegex = /\b(ace|jack|queen|king|10|[2-9])(?:\s+(?:of|in|on|at|4|2))?\s+(clubs?|clovers?|flowers?|hearts?|spades?|diamonds?)\b/;
             const pairedMatch = text.match(pairedCardRegex);
 
@@ -296,7 +306,6 @@
                 rawSuit = pairedMatch[2];
                 remainingText = text.replace(pairedMatch[0], ' ');
             } else {
-                // Fallback if words were separated
                 const suitMatch = text.match(/\b(clubs?|clovers?|flowers?|hearts?|spades?|diamonds?)\b/);
                 const valueMatch = text.match(/\b(ace|jack|queen|king|10|[2-9])\b/);
                 if (!suitMatch || !valueMatch) {
@@ -307,7 +316,6 @@
                 remainingText = text.replace(valueMatch[0], ' ').replace(suitMatch[0], ' ');
             }
 
-            // Normalize suit name
             let suit = rawSuit;
             if (suit.startsWith('club') || suit.startsWith('clover') || suit.startsWith('flower')) suit = 'clubs';
             else if (suit.startsWith('heart')) suit = 'hearts';
@@ -320,10 +328,8 @@
                 return { valid: false, partialCardHeard: true };
             }
 
-            // 2. Extract target position (1 to 52) from remaining sentence
             const numbersFound = remainingText.match(/\b([1-9]|[1-4][0-9]|5[0-2])\b/g);
             if (!numbersFound || numbersFound.length === 0) {
-                // Heard a valid card (e.g., "10 of Spades"), but missed the position number!
                 return { valid: false, partialCardHeard: true };
             }
 
@@ -341,12 +347,10 @@
             const parsed = parseCardAndPosition(rawText);
 
             if (!parsed.valid) {
-                // Only say "Repeat" if you actually tried to name a card/suit and it missed part of it
                 if (parsed.partialCardHeard) {
                     debugEl.innerText = `Missed part of card: "${rawText}"`;
                     speakResult("Repeat.");
                 } else {
-                    // Normal conversation or background chatter -> Stay 100% silent
                     debugEl.innerText = `Ignored chatter: "${rawText}"`;
                     resetToListening();
                 }
