@@ -4,7 +4,7 @@ export default async function handler(req, res) {
     }
     
     try {
-        // MODE 1: Text-to-Speech (Generate MP3 for Bluetooth earpiece)
+        // MODE 1: Text-to-Speech (Audio output to earpiece)
         if (req.body.action === 'tts') {
             const ttsResponse = await fetch('https://api.openai.com/v1/audio/speech', {
                 method: 'POST',
@@ -31,10 +31,10 @@ export default async function handler(req, res) {
             return res.status(200).json({ audio: base64Audio });
         }
 
-        // MODE 2: Speech-to-Text (Whisper Transcription)
+        // MODE 2: Speech-to-Text (Whisper configured for SG/MY English)
         const base64Audio = req.body.audio;
         if (!base64Audio) {
-            return res.status(400).json({ error: "No audio received from phone" });
+            return res.status(400).json({ error: "No audio received" });
         }
         
         const audioBuffer = Buffer.from(base64Audio, 'base64');
@@ -44,8 +44,9 @@ export default async function handler(req, res) {
         formData.append('file', audioBlob, 'audio.mp4');
         formData.append('model', 'whisper-1');
         formData.append('language', 'en');
-        // Prompt Whisper with playing card vocabulary so it doesn't hear "pool" instead of "two/four"
-        formData.append('prompt', 'Ace, two, three, four, five, six, seven, eight, nine, ten, jack, queen, king of clubs, hearts, spades, diamonds, 1 to 52.');
+        formData.append('temperature', '0'); // Kills hallucinations like "Thank you for watching/joining"
+        // Prompt tuned for Singapore/Malaysia English and card magic terms
+        formData.append('prompt', 'Singapore and Malaysia English ACAAN trick. Ace, 2, two, 3, three, 4, four, 5, five, 6, six, 7, seven, 8, eight, 9, nine, 10, ten, Jack, Queen, King of Clubs, Clovers, Flowers, Hearts, Spades, Diamonds. Position number 1 to 52.');
         
         const aiResponse = await fetch('https://api.openai.com/v1/audio/transcriptions', {
             method: 'POST',
