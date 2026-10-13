@@ -56,13 +56,15 @@
         let recordedChunks = [];
         const PRE_ROLL_MAX_CHUNKS = 5; 
 
-        // Two-way memory: works whether you say Card first OR Position first
+        // Two-way memory
         let pendingCard = null;
         let pendingPosition = null;
         let pendingTimer = null;
 
-        // Pre-cached "Repeat." audio so missed input alerts play in 0ms
+        // Pre-cached audio alerts for instant pocket feedback
         let cachedRepeatBase64 = null;
+        let cachedNumberBase64 = null;
+        let cachedCardBase64 = null;
 
         function unlockAudioContext() {
             if (!audioContext) return;
@@ -81,16 +83,22 @@
         document.body.addEventListener('touchend', unlockAudioContext, { passive: true });
         document.body.addEventListener('click', unlockAudioContext);
 
-        async function preloadRepeatAudio() {
-            try {
-                const res = await fetch('/api/transcribe', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ action: 'tts', text: 'Repeat.' })
-                });
-                const data = await res.json();
-                if (data.audio) cachedRepeatBase64 = data.audio;
-            } catch (e) {}
+        async function preloadAlerts() {
+            const fetchAudio = async (text) => {
+                try {
+                    const res = await fetch('/api/transcribe', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ action: 'tts', text: text })
+                    });
+                    const data = await res.json();
+                    return data.audio || null;
+                } catch (e) { return null; }
+            };
+            
+            cachedRepeatBase64 = await fetchAudio("Repeat.");
+            cachedNumberBase64 = await fetchAudio("Number.");
+            cachedCardBase64 = await fetchAudio("Card.");
         }
 
         async function startListening() {
@@ -101,7 +109,6 @@
                 audioContext = new (window.AudioContext || window.webkitAudioContext)();
                 const sourceNode = audioContext.createMediaStreamSource(audioStream);
 
-                // 2048 buffer size (~46ms latency) for faster speech cutoff response
                 processorNode = audioContext.createScriptProcessor(2048, 1, 1);
                 const silentGain = audioContext.createGain();
                 silentGain.gain.value = 0;
@@ -151,7 +158,6 @@
                         }
 
                         clearTimeout(silenceTimer);
-                        // Fast 750ms silence trigger saves ~0.85s after you finish speaking
                         silenceTimer = setTimeout(() => {
                             if (isRecording) finishRecordingAndTranscribe();
                         }, 750);
@@ -159,16 +165,14 @@
                 };
 
                 resetToListening();
-                preloadRepeatAudio();
+                preloadAlerts();
 
             } catch (err) {
                 statusEl.innerText = "Mic Permission Denied";
             }
         }
 
-        // Fast 8kHz WAV encoder + trims silent tail chunks
         function encodeWAV(chunks, inputSampleRate) {
-            // Trim trailing silent chunks so Whisper processes faster
             let endIdx = chunks.length;
             while (endIdx > 4) {
                 const c = chunks[endIdx - 1];
@@ -271,7 +275,6 @@
                     return;
                 }
 
-                // Single-trip instant resolution (Text + Audio returned together)
                 if (data.resolved) {
                     clearTimeout(pendingTimer);
                     pendingCard = null;
@@ -304,36 +307,49 @@
                     pendingCard = null;
                     pendingPosition = null;
                     debugEl.innerText = "Timed out waiting for second part.";
-                    playRepeatAlert();
+                    playAlert('repeat');
                 }
             }, 12000);
+        }
+
+        function playAlert(type) {
+            let base64 = null;
+            let fallback = "";
+            
+            if (type === 'repeat') { base64 = cachedRepeatBase64; fallback = "Repeat."; }
+            else if (type === 'number') { base64 = cachedNumberBase64; fallback = "Number."; }
+            else if (type === 'card') { base64 = cachedCardBase64; fallback = "Card."; }
+            
+            if (base64) playBase64Audio(base64);
+            else speakFallback(fallback);
         }
 
         function handleUnresolvedSpeech(data) {
             const rawText = data.text || "";
 
-            // Card spoken first -> Lock card and wait for position
+            // Card spoken first -> Request number
             if (data.card && !data.position) {
                 pendingCard = data.card;
                 const formatted = data.card.replace(/\b\w/g, c => c.toUpperCase());
                 debugEl.innerText = `Locked: ${formatted} — Say position...`;
                 startPendingTimeout();
-                resetToListening();
+                playAlert('number');
                 return;
             }
 
-            // Position spoken first (e.g. "37, yes") -> Lock position and wait for card!
+            // Position spoken first -> Request card
             if (!data.card && data.position) {
                 pendingPosition = data.position;
                 debugEl.innerText = `Locked Position: ${data.position} — Say card...`;
                 startPendingTimeout();
-                resetToListening();
+                playAlert('card');
                 return;
             }
 
+            // Missed part of the suit/value
             if (data.partialCardAttempt) {
                 debugEl.innerText = `Missed card value: "${rawText}"`;
-                playRepeatAlert();
+                playAlert('repeat');
                 return;
             }
 
@@ -345,14 +361,6 @@
                 debugEl.innerText = `Ignored chatter: "${rawText}"`;
             }
             resetToListening();
-        }
-
-        function playRepeatAlert() {
-            if (cachedRepeatBase64) {
-                playBase64Audio(cachedRepeatBase64);
-            } else {
-                speakFallback("Repeat.");
-            }
         }
 
         async function playBase64Audio(base64Audio) {
