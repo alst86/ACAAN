@@ -196,7 +196,8 @@
             }
             let average = sum / dataArray.length;
 
-            const SPEECH_THRESHOLD = 15; 
+            // Lowered from 15 to 10 so the first word ("10 of...") is never clipped
+            const SPEECH_THRESHOLD = 10; 
 
             if (average > SPEECH_THRESHOLD) {
                 if (!isRecording && mediaRecorder && mediaRecorder.state === 'inactive') {
@@ -208,12 +209,13 @@
                 
                 clearTimeout(silenceTimer);
                 
+                // 1.6s pause window allows natural breathing between naming card and position
                 silenceTimer = setTimeout(() => {
                     if (isRecording && mediaRecorder && mediaRecorder.state !== 'inactive') {
                         isRecording = false;
                         mediaRecorder.stop(); 
                     }
-                }, 1200); 
+                }, 1600); 
             }
             
             animationFrameId = requestAnimationFrame(monitorAudioLevel);
@@ -221,17 +223,23 @@
 
         // --- STRICT CARD, SUIT & POSITION VALIDATION ---
         function parseCardAndPosition(rawText) {
-            // Discard common Whisper silence hallucinations
-            if (/thank you for|watching|joining|subtitles/i.test(rawText)) {
-                return null;
+            const cleanRaw = rawText.trim();
+
+            // Ignore pure silence or Whisper background noise hallucinations silently
+            if (
+                cleanRaw.length < 2 ||
+                /^(you|thank you|thanks|bye|okay|oh|uh|um)$/i.test(cleanRaw) ||
+                /thank you for|watching|joining|subtitles|amara\.org/i.test(cleanRaw)
+            ) {
+                return { valid: false, silentIgnore: true };
             }
 
-            let text = rawText.toLowerCase().replace(/[.,!?]/g, ' ').replace(/\s+/g, ' ').trim();
+            let text = cleanRaw.toLowerCase().replace(/[.,!?]/g, ' ').replace(/\s+/g, ' ').trim();
 
-            // Normalize word numbers up to 52 for SG/MY speech
             const wordToNum = {
-                'one': '1', 'two': '2', 'three': '3', 'tree': '3', 'four': '4', 'for': '4', 'ford': '4',
-                'five': '5', 'six': '6', 'seven': '7', 'eight': '8', 'ate': '8', 'nine': '9', 'ten': '10',
+                'one': '1', 'two': '2', 'to': '2', 'too': '2', 'three': '3', 'tree': '3',
+                'four': '4', 'for': '4', 'ford': '4', 'five': '5', 'six': '6', 'seven': '7',
+                'eight': '8', 'ate': '8', 'nine': '9', 'ten': '10',
                 'eleven': '11', 'twelve': '12', 'thirteen': '13', 'fourteen': '14', 'fifteen': '15',
                 'sixteen': '16', 'seventeen': '17', 'eighteen': '18', 'nineteen': '19', 'twenty': '20',
                 'thirty': '30', 'forty': '40', 'fifty': '50'
@@ -240,12 +248,11 @@
             for (const [w, n] of Object.entries(wordToNum)) {
                 text = text.replace(new RegExp(`\\b${w}\\b`, 'g'), n);
             }
-            // Compound numbers like "20 5" -> "25"
             text = text.replace(/\b(20|30|40|50)\s+([1-9])\b/g, (m, tens, ones) => String(parseInt(tens) + parseInt(ones)));
 
-            // 1. Identify Suit (including SG/MY terms "clover" and "flower" for clubs)
+            // 1. Identify Suit
             const suitMatch = text.match(/\b(clubs?|clovers?|flowers?|hearts?|spades?|diamonds?)\b/);
-            if (!suitMatch) return null; // No suit = DO NOT OUTPUT
+            if (!suitMatch) return { valid: false, silentIgnore: false };
 
             let suit = suitMatch[1];
             if (suit.startsWith('club') || suit.startsWith('clover') || suit.startsWith('flower')) suit = 'clubs';
@@ -253,29 +260,25 @@
             else if (suit.startsWith('spade')) suit = 'spades';
             else if (suit.startsWith('diamond')) suit = 'diamonds';
 
-            // 2. Identify Card Value (Ace, 2-10, Jack, Queen, King)
-            // Look for card value near the suit or in phrase
+            // 2. Identify Card Value
             const valueMatch = text.match(/\b(ace|jack|queen|king|10|[2-9])\b/);
-            if (!valueMatch) return null; // No card value = DO NOT OUTPUT
+            if (!valueMatch) return { valid: false, silentIgnore: false };
 
             let value = valueMatch[1];
             const targetCard = `${value} of ${suit}`;
 
-            // Ensure card is in deck
             const cardIndex = stack.indexOf(targetCard);
-            if (cardIndex === -1) return null;
+            if (cardIndex === -1) return { valid: false, silentIgnore: false };
 
             // 3. Identify Target Position (1 to 52)
-            // Remove the card components from text so the card value doesn't conflict with position
             let remainingText = text.replace(valueMatch[0], ' ').replace(suitMatch[0], ' ');
-            
             const numbersFound = remainingText.match(/\b([1-9]|[1-4][0-9]|5[0-2])\b/g);
-            if (!numbersFound || numbersFound.length === 0) return null; // No position = DO NOT OUTPUT
+            if (!numbersFound || numbersFound.length === 0) return { valid: false, silentIgnore: false };
 
-            // Take the position number
             const targetPosition = parseInt(numbersFound[numbersFound.length - 1], 10);
 
             return {
+                valid: true,
                 card: targetCard,
                 cardIndex: cardIndex,
                 position: targetPosition
@@ -285,35 +288,42 @@
         function processSpeechInput(rawText) {
             const parsed = parseCardAndPosition(rawText);
 
-            if (!parsed) {
-                // Incomplete input: keep old results hidden, display what was heard
+            if (!parsed.valid) {
                 resultEl.style.display = 'none';
                 debugEl.innerText = `Heard: "${rawText}" (Need card value, suit & number)`;
-                resetToListening();
+                
+                // If real speech was detected but incomplete, notify via earpiece immediately
+                if (!parsed.silentIgnore) {
+                    speakResult("Missed, repeat.");
+                } else {
+                    resetToListening();
+                }
                 return;
             }
 
-            // All 3 validated: Card Value, Suit, and Position (1-52)
-            const currentPosition = parsed.cardIndex + 1; // 1-indexed in stack
+            const currentPosition = parsed.cardIndex + 1; 
             const targetPosition = parsed.position;
+            const formattedHeardCard = parsed.card.replace(/\b\w/g, c => c.toUpperCase());
 
             let cutAmount = currentPosition - targetPosition;
             if (cutAmount < 0) cutAmount += 52;
 
             if (cutAmount === 0) {
-                debugEl.innerText = `Heard: ${parsed.card} at ${targetPosition}`;
-                resultEl.innerText = "Card already at position. Cut 0.";
+                debugEl.innerText = `Heard: ${formattedHeardCard} at ${targetPosition}`;
+                resultEl.innerText = `${formattedHeardCard} at ${targetPosition} — Cut 0.`;
                 resultEl.style.display = 'block';
-                speakResult("Card is already at target position.");
+                speakResult(`${formattedHeardCard} at ${targetPosition}. Already there, cut zero.`);
                 return;
             }
 
             const bottomCardIndex = (cutAmount - 1 + 52) % 52;
             const bottomCard = stack[bottomCardIndex];
             const formattedBottom = bottomCard.replace(/\b\w/g, c => c.toUpperCase());
-            const outputText = `Cut ${cutAmount} cards, ${formattedBottom}.`;
+            
+            // Confirms the heard card + position first, then gives the cut instruction
+            const outputText = `${formattedHeardCard} at ${targetPosition}. Cut ${cutAmount} cards, ${formattedBottom}.`;
 
-            debugEl.innerText = `Heard: ${parsed.card} at position ${targetPosition}`;
+            debugEl.innerText = `Heard: ${formattedHeardCard} at position ${targetPosition}`;
             resultEl.innerText = `Cut ${cutAmount} cards (${formattedBottom}).`;
             resultEl.style.display = 'block';
 
@@ -331,7 +341,7 @@
 
             speechFailSafeTimeout = setTimeout(() => {
                 resetToListening();
-            }, 6000);
+            }, 8000);
 
             try {
                 const res = await fetch('/api/transcribe', {
