@@ -51,20 +51,25 @@
         const resultEl = document.getElementById('result');
 
         let isSpeaking = false;
+        let isAnalyzing = false;
+        let isRecording = false;
         let speechFailSafeTimeout = null;
         
         let audioContext = null;
-        let mediaRecorder = null;
         let audioStream = null;
-        let audioChunks = [];
-        let isRecording = false;
+        let processorNode = null;
         let silenceTimer = null;
         let maxRecordTimer = null;
-        let analyser = null;
-        let timeDomainArray = null;
-        let animationFrameId = null;
 
-        // Synchronously unlock WebAudio on touch without using an <audio> tag
+        // Raw PCM Recording Buffers (No MediaRecorder needed)
+        let preRollChunks = [];
+        let recordedChunks = [];
+        const PRE_ROLL_MAX_CHUNKS = 6; // ~0.5s pre-roll so first word is never clipped
+
+        // 2-Breath Memory if card and number are spoken with a pause between them
+        let pendingCard = null;
+        let pendingCardTimer = null;
+
         function unlockAudioContext() {
             if (!audioContext) return;
             if (audioContext.state !== 'running') {
@@ -87,80 +92,180 @@
 
             try {
                 audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                
                 audioContext = new (window.AudioContext || window.webkitAudioContext)();
                 const sourceNode = audioContext.createMediaStreamSource(audioStream);
-                analyser = audioContext.createAnalyser();
-                analyser.fftSize = 512;
 
-                // Connect through a zero-gain node to destination so iOS WebKit continuously pulls mic data
+                // Direct PCM capture node — bypasses buggy iOS MediaRecorder completely
+                processorNode = audioContext.createScriptProcessor(4096, 1, 1);
                 const silentGain = audioContext.createGain();
                 silentGain.gain.value = 0;
-                sourceNode.connect(analyser);
-                analyser.connect(silentGain);
+
+                sourceNode.connect(processorNode);
+                processorNode.connect(silentGain);
                 silentGain.connect(audioContext.destination);
 
-                timeDomainArray = new Uint8Array(analyser.fftSize);
+                processorNode.onaudioprocess = (e) => {
+                    if (isSpeaking || isAnalyzing) return;
 
-                mediaRecorder = new MediaRecorder(audioStream);
-                mediaRecorder.ondataavailable = e => { if (e.data.size > 0) audioChunks.push(e.data); };
-                
-                mediaRecorder.onstop = async () => {
-                    clearTimeout(silenceTimer);
-                    clearTimeout(maxRecordTimer);
-                    isRecording = false;
+                    const inputData = e.inputBuffer.getChannelData(0);
+                    const chunkCopy = new Float32Array(inputData);
 
-                    if (audioChunks.length === 0) {
-                        resetToListening();
-                        return;
+                    // Calculate peak level (0 - 100 scale)
+                    let maxPeak = 0;
+                    for (let i = 0; i < chunkCopy.length; i++) {
+                        const abs = Math.abs(chunkCopy[i]);
+                        if (abs > maxPeak) maxPeak = abs;
                     }
-                    const audioBlob = new Blob(audioChunks, { type: 'audio/mp4' });
-                    audioChunks = []; 
-                    
-                    statusEl.innerText = "Analyzing...";
-                    statusEl.style.color = "#ffb86c"; 
-                    
-                    const reader = new FileReader();
-                    reader.readAsDataURL(audioBlob);
-                    reader.onloadend = async () => {
-                        const base64data = reader.result.split(',')[1];
-                        
-                        try {
-                            const res = await fetch('/api/transcribe', { 
-                                method: 'POST', 
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({ audio: base64data })
-                            });
-                            const data = await res.json();
-                            
-                            if (data.error) {
-                                debugEl.innerText = `Error: ${data.error}`;
-                                resetToListening();
-                                return;
-                            }
-                            
-                            if (data.text) {
-                                processSpeechInput(data.text);
-                            } else {
-                                resetToListening();
-                            }
-                        } catch (e) {
-                            debugEl.innerText = "Connection error.";
-                            resetToListening();
+                    const displayLevel = Math.min(99, Math.round(maxPeak * 140));
+                    const SPEECH_THRESHOLD = 8;
+
+                    if (!isRecording) {
+                        // Maintain rolling 0.5s pre-roll buffer
+                        preRollChunks.push(chunkCopy);
+                        if (preRollChunks.length > PRE_ROLL_MAX_CHUNKS) {
+                            preRollChunks.shift();
                         }
-                    };
+                        statusEl.innerText = `Listening... (${displayLevel})`;
+                        statusEl.style.color = "#a0a5b5";
+                    } else {
+                        recordedChunks.push(chunkCopy);
+                    }
+
+                    if (displayLevel > SPEECH_THRESHOLD) {
+                        if (!isRecording) {
+                            isRecording = true;
+                            // Prepend pre-roll so the start of the word is never cut off
+                            recordedChunks = [...preRollChunks, chunkCopy];
+                            preRollChunks = [];
+                            statusEl.innerText = "Recording...";
+                            statusEl.style.color = "#ff5555";
+
+                            // Pause pending-card timeout while user is actively speaking
+                            if (pendingCardTimer) {
+                                clearTimeout(pendingCardTimer);
+                            }
+
+                            maxRecordTimer = setTimeout(() => {
+                                if (isRecording) finishRecordingAndTranscribe();
+                            }, 5500);
+                        }
+
+                        clearTimeout(silenceTimer);
+                        silenceTimer = setTimeout(() => {
+                            if (isRecording) finishRecordingAndTranscribe();
+                        }, 1600);
+                    }
                 };
 
                 resetToListening();
-                monitorAudioLevel();
 
             } catch (err) {
                 statusEl.innerText = "Mic Permission Denied";
             }
         }
 
+        // Encode raw Float32 audio into a compact 16kHz Mono WAV file
+        function encodeWAV(chunks, inputSampleRate) {
+            let totalLength = 0;
+            for (const c of chunks) totalLength += c.length;
+            const merged = new Float32Array(totalLength);
+            let offset = 0;
+            for (const c of chunks) {
+                merged.set(c, offset);
+                offset += c.length;
+            }
+
+            const targetRate = 16000;
+            const ratio = inputSampleRate / targetRate;
+            const newLength = Math.round(merged.length / ratio);
+            const buffer = new ArrayBuffer(44 + newLength * 2);
+            const view = new DataView(buffer);
+
+            const writeString = (off, str) => {
+                for (let i = 0; i < str.length; i++) view.setUint8(off + i, str.charCodeAt(i));
+            };
+
+            writeString(0, 'RIFF');
+            view.setUint32(4, 36 + newLength * 2, true);
+            writeString(8, 'WAVE');
+            writeString(12, 'fmt ');
+            view.setUint32(16, 16, true);
+            view.setUint16(20, 1, true);
+            view.setUint16(22, 1, true);
+            view.setUint32(24, targetRate, true);
+            view.setUint32(28, targetRate * 2, true);
+            view.setUint16(32, 2, true);
+            view.setUint16(34, 16, true);
+            writeString(36, 'data');
+            view.setUint32(40, newLength * 2, true);
+
+            let outOffset = 44;
+            for (let i = 0; i < newLength; i++) {
+                const sampleIndex = Math.min(merged.length - 1, Math.floor(i * ratio));
+                const s = Math.max(-1, Math.min(1, merged[sampleIndex]));
+                view.setInt16(outOffset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+                outOffset += 2;
+            }
+
+            const bytes = new Uint8Array(buffer);
+            let binary = '';
+            const chunkSize = 8192;
+            for (let i = 0; i < bytes.length; i += chunkSize) {
+                binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+            }
+            return window.btoa(binary);
+        }
+
+        async function finishRecordingAndTranscribe() {
+            clearTimeout(silenceTimer);
+            clearTimeout(maxRecordTimer);
+            isRecording = false;
+
+            const chunksToProcess = recordedChunks;
+            recordedChunks = [];
+
+            if (chunksToProcess.length === 0) {
+                resetToListening();
+                return;
+            }
+
+            isAnalyzing = true;
+            statusEl.innerText = "Analyzing...";
+            statusEl.style.color = "#ffb86c";
+
+            try {
+                const sampleRate = audioContext ? audioContext.sampleRate : 44100;
+                const base64Wav = encodeWAV(chunksToProcess, sampleRate);
+
+                const res = await fetch('/api/transcribe', { 
+                    method: 'POST', 
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ audio: base64Wav })
+                });
+                const data = await res.json();
+                isAnalyzing = false;
+
+                if (data.error) {
+                    debugEl.innerText = `Error: ${data.error}`;
+                    resetToListening();
+                    return;
+                }
+
+                if (data.text) {
+                    processSpeechInput(data.text);
+                } else {
+                    resetToListening();
+                }
+            } catch (e) {
+                isAnalyzing = false;
+                debugEl.innerText = "Connection error.";
+                resetToListening();
+            }
+        }
+
         function resetToListening() {
             isSpeaking = false;
+            isAnalyzing = false;
             clearTimeout(speechFailSafeTimeout);
             if (audioContext && audioContext.state !== 'running') {
                 audioContext.resume().catch(() => {});
@@ -170,9 +275,13 @@
         }
 
         function stopListening() {
-            if (animationFrameId) cancelAnimationFrame(animationFrameId);
-            if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-                mediaRecorder.stop();
+            clearTimeout(silenceTimer);
+            clearTimeout(maxRecordTimer);
+            clearTimeout(speechFailSafeTimeout);
+            clearTimeout(pendingCardTimer);
+            if (processorNode) {
+                try { processorNode.disconnect(); } catch (e) {}
+                processorNode = null;
             }
             if (audioStream) {
                 audioStream.getTracks().forEach(track => track.stop());
@@ -182,11 +291,9 @@
                 audioContext.close().catch(() => {});
                 audioContext = null;
             }
-            clearTimeout(silenceTimer);
-            clearTimeout(maxRecordTimer);
-            clearTimeout(speechFailSafeTimeout);
             isRecording = false;
             isSpeaking = false;
+            isAnalyzing = false;
             statusEl.innerText = "Paused";
         }
 
@@ -200,73 +307,15 @@
             }
         });
 
-        function monitorAudioLevel() {
-            if (!analyser || !audioStream) return;
-
-            if (audioContext && audioContext.state !== 'running') {
-                statusEl.innerText = "Tap screen once to wake mic";
-                statusEl.style.color = "#ffb86c";
-                animationFrameId = requestAnimationFrame(monitorAudioLevel);
-                return;
-            }
-
-            if (isSpeaking) {
-                animationFrameId = requestAnimationFrame(monitorAudioLevel);
-                return;
-            }
-
-            // Measure raw voice waveform peak (works accurately with narrowband Bluetooth mics)
-            analyser.getByteTimeDomainData(timeDomainArray);
-            let maxPeak = 0;
-            for (let i = 0; i < timeDomainArray.length; i++) {
-                const deviation = Math.abs(timeDomainArray[i] - 128);
-                if (deviation > maxPeak) maxPeak = deviation;
-            }
-
-            const SPEECH_THRESHOLD = 8; 
-
-            if (!isRecording) {
-                statusEl.innerText = `Listening... (${maxPeak})`;
-                statusEl.style.color = "#a0a5b5";
-            }
-
-            if (maxPeak > SPEECH_THRESHOLD) {
-                if (!isRecording && mediaRecorder && mediaRecorder.state === 'inactive') {
-                    isRecording = true;
-                    mediaRecorder.start();
-                    statusEl.innerText = "Recording...";
-                    statusEl.style.color = "#ff5555"; 
-
-                    maxRecordTimer = setTimeout(() => {
-                        if (isRecording && mediaRecorder && mediaRecorder.state !== 'inactive') {
-                            isRecording = false;
-                            mediaRecorder.stop();
-                        }
-                    }, 5000);
-                }
-                
-                clearTimeout(silenceTimer);
-                
-                silenceTimer = setTimeout(() => {
-                    if (isRecording && mediaRecorder && mediaRecorder.state !== 'inactive') {
-                        isRecording = false;
-                        mediaRecorder.stop(); 
-                    }
-                }, 1400); 
-            }
-            
-            animationFrameId = requestAnimationFrame(monitorAudioLevel);
-        }
-
-        function parseCardAndPosition(rawText) {
+        function extractElements(rawText) {
             const cleanRaw = rawText.trim();
 
             if (
-                cleanRaw.length < 2 ||
+                cleanRaw.length < 1 ||
                 /^(you|thank you|thanks|bye|okay|oh|uh|um)$/i.test(cleanRaw) ||
                 /thank you for|watching|joining|subtitles|amara\.org/i.test(cleanRaw)
             ) {
-                return { valid: false, partialCardHeard: false };
+                return { card: null, position: null, partialCardAttempt: false };
             }
 
             let text = cleanRaw.toLowerCase().replace(/[.,!?-]/g, ' ').replace(/\s+/g, ' ').trim();
@@ -291,76 +340,113 @@
             const hasSuitKeyword = /\b(clubs?|clovers?|flowers?|hearts?|spades?|diamonds?)\b/.test(text);
             const hasFaceKeyword = /\b(ace|jack|queen|king)\b/.test(text);
 
-            if (!hasSuitKeyword) {
-                return { valid: false, partialCardHeard: hasFaceKeyword };
-            }
-
-            const pairedCardRegex = /\b(ace|jack|queen|king|10|[2-9])(?:\s+(?:of|in|on|at|4|2))?\s+(clubs?|clovers?|flowers?|hearts?|spades?|diamonds?)\b/;
-            const pairedMatch = text.match(pairedCardRegex);
-
-            let value = null;
-            let rawSuit = null;
+            let detectedCard = null;
             let remainingText = text;
 
-            if (pairedMatch) {
-                value = pairedMatch[1];
-                rawSuit = pairedMatch[2];
-                remainingText = text.replace(pairedMatch[0], ' ');
-            } else {
-                const suitMatch = text.match(/\b(clubs?|clovers?|flowers?|hearts?|spades?|diamonds?)\b/);
-                const valueMatch = text.match(/\b(ace|jack|queen|king|10|[2-9])\b/);
-                if (!suitMatch || !valueMatch) {
-                    return { valid: false, partialCardHeard: true };
+            if (hasSuitKeyword) {
+                const pairedCardRegex = /\b(ace|jack|queen|king|10|[2-9])(?:\s+(?:of|in|on|at|4|2))?\s+(clubs?|clovers?|flowers?|hearts?|spades?|diamonds?)\b/;
+                const pairedMatch = text.match(pairedCardRegex);
+
+                let value = null;
+                let rawSuit = null;
+
+                if (pairedMatch) {
+                    value = pairedMatch[1];
+                    rawSuit = pairedMatch[2];
+                    remainingText = text.replace(pairedMatch[0], ' ');
+                } else {
+                    const suitMatch = text.match(/\b(clubs?|clovers?|flowers?|hearts?|spades?|diamonds?)\b/);
+                    const valueMatch = text.match(/\b(ace|jack|queen|king|10|[2-9])\b/);
+                    if (suitMatch && valueMatch) {
+                        value = valueMatch[1];
+                        rawSuit = suitMatch[1];
+                        remainingText = text.replace(valueMatch[0], ' ').replace(suitMatch[0], ' ');
+                    }
                 }
-                value = valueMatch[1];
-                rawSuit = suitMatch[1];
-                remainingText = text.replace(valueMatch[0], ' ').replace(suitMatch[0], ' ');
-            }
 
-            let suit = rawSuit;
-            if (suit.startsWith('club') || suit.startsWith('clover') || suit.startsWith('flower')) suit = 'clubs';
-            else if (suit.startsWith('heart')) suit = 'hearts';
-            else if (suit.startsWith('spade')) suit = 'spades';
-            else if (suit.startsWith('diamond')) suit = 'diamonds';
+                if (value && rawSuit) {
+                    let suit = rawSuit;
+                    if (suit.startsWith('club') || suit.startsWith('clover') || suit.startsWith('flower')) suit = 'clubs';
+                    else if (suit.startsWith('heart')) suit = 'hearts';
+                    else if (suit.startsWith('spade')) suit = 'spades';
+                    else if (suit.startsWith('diamond')) suit = 'diamonds';
 
-            const targetCard = `${value} of ${suit}`;
-            const cardIndex = stack.indexOf(targetCard);
-            if (cardIndex === -1) {
-                return { valid: false, partialCardHeard: true };
+                    const candidate = `${value} of ${suit}`;
+                    if (stack.indexOf(candidate) !== -1) {
+                        detectedCard = candidate;
+                    }
+                }
             }
 
             const numbersFound = remainingText.match(/\b([1-9]|[1-4][0-9]|5[0-2])\b/g);
-            if (!numbersFound || numbersFound.length === 0) {
-                return { valid: false, partialCardHeard: true };
-            }
-
-            const targetPosition = parseInt(numbersFound[numbersFound.length - 1], 10);
+            const detectedPosition = (numbersFound && numbersFound.length > 0)
+                ? parseInt(numbersFound[numbersFound.length - 1], 10)
+                : null;
 
             return {
-                valid: true,
-                card: targetCard,
-                cardIndex: cardIndex,
-                position: targetPosition
+                card: detectedCard,
+                position: detectedPosition,
+                partialCardAttempt: (hasSuitKeyword || hasFaceKeyword) && !detectedCard
             };
         }
 
         function processSpeechInput(rawText) {
-            const parsed = parseCardAndPosition(rawText);
+            const { card, position, partialCardAttempt } = extractElements(rawText);
 
-            if (!parsed.valid) {
-                if (parsed.partialCardHeard) {
-                    debugEl.innerText = `Missed part of card: "${rawText}"`;
-                    speakResult("Repeat.");
-                } else {
-                    debugEl.innerText = `Ignored chatter: "${rawText}"`;
-                    resetToListening();
-                }
+            // CASE 1: Both Card and Position spoken together
+            if (card && position) {
+                clearTimeout(pendingCardTimer);
+                pendingCard = null;
+                executeCalculation(card, position);
                 return;
             }
 
-            const currentPosition = parsed.cardIndex + 1; 
-            const targetPosition = parsed.position;
-            const formattedHeardCard = parsed.card.replace(/\b\w/g, c => c.toUpperCase());
+            // CASE 2: Only Card spoken (e.g. "King of Clubs") — Lock card & wait for position number!
+            if (card && !position) {
+                pendingCard = card;
+                const formatted = card.replace(/\b\w/g, c => c.toUpperCase());
+                debugEl.innerText = `Locked: ${formatted} — Say position number...`;
+                
+                clearTimeout(pendingCardTimer);
+                pendingCardTimer = setTimeout(() => {
+                    if (pendingCard) {
+                        pendingCard = null;
+                        debugEl.innerText = `Timed out waiting for position.`;
+                        speakResult("Repeat.");
+                    }
+                }, 10000); // Wait up to 10 seconds for the position number
+
+                resetToListening();
+                return;
+            }
+
+            // CASE 3: Position spoken right after a Card was locked in memory!
+            if (!card && position && pendingCard) {
+                const lockedCard = pendingCard;
+                pendingCard = null;
+                clearTimeout(pendingCardTimer);
+                executeCalculation(lockedCard, position);
+                return;
+            }
+
+            // CASE 4: Tried to say a card (e.g. "Spades 36") but missed the card value
+            if (partialCardAttempt) {
+                debugEl.innerText = `Missed card value: "${rawText}"`;
+                speakResult("Repeat.");
+                return;
+            }
+
+            // CASE 5: Normal conversation chatter — Ignore silently
+            debugEl.innerText = pendingCard
+                ? `Locked: ${pendingCard.toUpperCase()} — Waiting for number...`
+                : `Ignored chatter: "${rawText}"`;
+            resetToListening();
+        }
+
+        function executeCalculation(card, targetPosition) {
+            const cardIndex = stack.indexOf(card);
+            const currentPosition = cardIndex + 1; 
+            const formattedHeardCard = card.replace(/\b\w/g, c => c.toUpperCase());
 
             let cutAmount = currentPosition - targetPosition;
             if (cutAmount < 0) cutAmount += 52;
