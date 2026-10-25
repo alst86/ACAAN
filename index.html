@@ -21,13 +21,20 @@
             user-select: none;
         }
         h1 { color: #9d84ff; font-size: 2rem; margin-bottom: 10px; }
-        #status { font-size: 1.2rem; margin-top: 20px; color: #a0a5b5; transition: color 0.15s; }
+        #status { font-size: 1.2rem; margin-top: 20px; color: #a0a5b5; transition: color 0.1s; }
         #debug { font-size: 0.9rem; margin-top: 10px; color: #777; font-style: italic; min-height: 24px; padding: 0 20px; }
         #result { font-size: 1.4rem; margin-top: 30px; font-weight: bold; color: #ffffff; padding: 20px; border-radius: 10px; background: #232533; display: none; width: 80%; }
         #app-content { display: flex; flex-direction: column; align-items: center; width: 100%; }
+        /* Hidden iOS 18+ Taptic Engine Switch */
+        #haptic-wrap { position: absolute; opacity: 0; pointer-events: none; width: 1px; height: 1px; overflow: hidden; }
     </style>
 </head>
 <body>
+
+    <div id="haptic-wrap">
+        <input type="checkbox" id="haptic-switch" switch>
+        <label for="haptic-switch" id="haptic-label"></label>
+    </div>
 
     <div id="app-content">
         <h1>ACAAN</h1>
@@ -40,11 +47,14 @@
         const statusEl = document.getElementById('status');
         const debugEl = document.getElementById('debug');
         const resultEl = document.getElementById('result');
+        const hapticLabel = document.getElementById('haptic-label');
 
         let isSpeaking = false;
         let isAnalyzing = false;
         let isRecording = false;
+        let hasAnnouncedReady = false;
         let speechFailSafeTimeout = null;
+        let keepWarmInterval = null;
         
         let audioContext = null;
         let audioStream = null;
@@ -54,51 +64,134 @@
 
         let preRollChunks = [];
         let recordedChunks = [];
-        const PRE_ROLL_MAX_CHUNKS = 5; 
+        const PRE_ROLL_MAX_CHUNKS = 6; 
+        let utterancePeak = 0;
 
         // Two-way memory
         let pendingCard = null;
         let pendingPosition = null;
         let pendingTimer = null;
 
-        // Pre-cached audio alerts for instant pocket feedback
-        let cachedRepeatBase64 = null;
-        let cachedNumberBase64 = null;
-        let cachedCardBase64 = null;
+        // Pre-decoded AudioBuffers for 0ms pocket playback
+        const alertBuffers = {
+            ready: null,
+            repeat: null,
+            number: null,
+            card: null
+        };
+
+        // --- HAPTIC & COVERT EAR-CON SYNTHESIZER ---
+        function triggerHaptic(pattern = [60]) {
+            try {
+                if (navigator.vibrate) navigator.vibrate(pattern);
+                if (hapticLabel) hapticLabel.click();
+            } catch (e) {}
+        }
+
+        // Plays instant synthesized tones directly into the Bluetooth earpiece
+        function playEarcon(type) {
+            if (!audioContext || audioContext.state !== 'running') return;
+            try {
+                const now = audioContext.currentTime;
+                const osc = audioContext.createOscillator();
+                const gain = audioContext.createGain();
+                osc.connect(gain);
+                gain.connect(audioContext.destination);
+
+                if (type === 'ready') {
+                    // Crisp ascending double-chime (660Hz -> 880Hz)
+                    osc.type = 'sine';
+                    osc.frequency.setValueAtTime(660, now);
+                    osc.frequency.setValueAtTime(880, now + 0.09);
+                    gain.gain.setValueAtTime(0.18, now);
+                    gain.gain.exponentialRampToValueAtTime(0.01, now + 0.22);
+                    osc.start(now);
+                    osc.stop(now + 0.23);
+                } else if (type === 'listening') {
+                    // Subtle 45ms high blip when mic re-opens
+                    osc.type = 'sine';
+                    osc.frequency.setValueAtTime(784, now);
+                    gain.gain.setValueAtTime(0.09, now);
+                    gain.gain.exponentialRampToValueAtTime(0.005, now + 0.05);
+                    osc.start(now);
+                    osc.stop(now + 0.055);
+                } else if (type === 'captured') {
+                    // Soft 35ms low tick when recording cuts to Analyzing
+                    osc.type = 'triangle';
+                    osc.frequency.setValueAtTime(420, now);
+                    gain.gain.setValueAtTime(0.12, now);
+                    gain.gain.exponentialRampToValueAtTime(0.005, now + 0.04);
+                    osc.start(now);
+                    osc.stop(now + 0.045);
+                }
+            } catch (e) {}
+        }
 
         function unlockAudioContext() {
+            triggerHaptic([40]);
             if (!audioContext) return;
             if (audioContext.state !== 'running') {
-                audioContext.resume().catch(() => {});
+                audioContext.resume().then(() => {
+                    announceReadyOnce();
+                }).catch(() => {});
+            } else {
+                announceReadyOnce();
             }
-            try {
-                const buffer = audioContext.createBuffer(1, 1, 22050);
-                const source = audioContext.createBufferSource();
-                source.buffer = buffer;
-                source.connect(audioContext.destination);
-                source.start(0);
-            } catch (e) {}
         }
         document.body.addEventListener('touchstart', unlockAudioContext, { passive: true });
         document.body.addEventListener('touchend', unlockAudioContext, { passive: true });
         document.body.addEventListener('click', unlockAudioContext);
 
+        async function decodeBase64ToBuffer(base64) {
+            if (!base64 || !audioContext) return null;
+            try {
+                const binaryString = window.atob(base64);
+                const len = binaryString.length;
+                const bytes = new Uint8Array(len);
+                for (let i = 0; i < len; i++) {
+                    bytes[i] = binaryString.charCodeAt(i);
+                }
+                return await new Promise((resolve) => {
+                    audioContext.decodeAudioData(bytes.buffer, resolve, () => resolve(null));
+                });
+            } catch (e) {
+                return null;
+            }
+        }
+
         async function preloadAlerts() {
-            const fetchAudio = async (text) => {
-                try {
-                    const res = await fetch('/api/transcribe', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ action: 'tts', text: text })
-                    });
-                    const data = await res.json();
-                    return data.audio || null;
-                } catch (e) { return null; }
-            };
-            
-            cachedRepeatBase64 = await fetchAudio("Repeat.");
-            cachedNumberBase64 = await fetchAudio("Number.");
-            cachedCardBase64 = await fetchAudio("Card.");
+            try {
+                const res = await fetch('/api/transcribe', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ action: 'init_alerts' })
+                });
+                const data = await res.json();
+                const [readyBuf, repeatBuf, numberBuf, cardBuf] = await Promise.all([
+                    decodeBase64ToBuffer(data.ready),
+                    decodeBase64ToBuffer(data.repeat),
+                    decodeBase64ToBuffer(data.number),
+                    decodeBase64ToBuffer(data.card)
+                ]);
+                alertBuffers.ready = readyBuf;
+                alertBuffers.repeat = repeatBuf;
+                alertBuffers.number = numberBuf;
+                alertBuffers.card = cardBuf;
+
+                if (!hasAnnouncedReady && audioContext && audioContext.state === 'running') {
+                    announceReadyOnce();
+                }
+            } catch (e) {}
+        }
+
+        function announceReadyOnce() {
+            if (hasAnnouncedReady || !audioContext || audioContext.state !== 'running') return;
+            hasAnnouncedReady = true;
+            triggerHaptic([70, 50, 70]);
+            playEarcon('ready');
+            if (alertBuffers.ready) {
+                setTimeout(() => playDecodedBuffer(alertBuffers.ready, false), 180);
+            }
         }
 
         async function startListening() {
@@ -109,7 +202,8 @@
                 audioContext = new (window.AudioContext || window.webkitAudioContext)();
                 const sourceNode = audioContext.createMediaStreamSource(audioStream);
 
-                processorNode = audioContext.createScriptProcessor(2048, 1, 1);
+                // 1024 frame size (~23ms resolution) for ultra-fast speech cutoff
+                processorNode = audioContext.createScriptProcessor(1024, 1, 1);
                 const silentGain = audioContext.createGain();
                 silentGain.gain.value = 0;
 
@@ -129,7 +223,7 @@
                         if (abs > maxPeak) maxPeak = abs;
                     }
                     const displayLevel = Math.min(99, Math.round(maxPeak * 140));
-                    const SPEECH_THRESHOLD = 8;
+                    const START_THRESHOLD = 9;
 
                     if (!isRecording) {
                         preRollChunks.push(chunkCopy);
@@ -138,13 +232,10 @@
                         }
                         statusEl.innerText = `Listening... (${displayLevel})`;
                         statusEl.style.color = "#a0a5b5";
-                    } else {
-                        recordedChunks.push(chunkCopy);
-                    }
 
-                    if (displayLevel > SPEECH_THRESHOLD) {
-                        if (!isRecording) {
+                        if (displayLevel > START_THRESHOLD) {
                             isRecording = true;
+                            utterancePeak = displayLevel;
                             recordedChunks = [...preRollChunks, chunkCopy];
                             preRollChunks = [];
                             statusEl.innerText = "Recording...";
@@ -154,18 +245,46 @@
 
                             maxRecordTimer = setTimeout(() => {
                                 if (isRecording) finishRecordingAndTranscribe();
-                            }, 4200);
+                            }, 3200);
+
+                            clearTimeout(silenceTimer);
+                            silenceTimer = setTimeout(() => {
+                                if (isRecording) finishRecordingAndTranscribe();
+                            }, 460);
+                        }
+                    } else {
+                        recordedChunks.push(chunkCopy);
+                        if (displayLevel > utterancePeak) {
+                            utterancePeak = displayLevel;
                         }
 
-                        clearTimeout(silenceTimer);
-                        silenceTimer = setTimeout(() => {
-                            if (isRecording) finishRecordingAndTranscribe();
-                        }, 750);
+                        // Dynamic threshold: ignores room noise so silence timer doesn't hang
+                        const dynamicContinueThreshold = Math.max(9, Math.min(18, Math.round(utterancePeak * 0.35)));
+
+                        if (displayLevel > dynamicContinueThreshold) {
+                            clearTimeout(silenceTimer);
+                            silenceTimer = setTimeout(() => {
+                                if (isRecording) finishRecordingAndTranscribe();
+                            }, 460);
+                        }
                     }
                 };
 
-                resetToListening();
+                resetToListening(false);
+                announceReadyOnce();
                 preloadAlerts();
+
+                // Keep Vercel serverless container warm while in pocket
+                clearInterval(keepWarmInterval);
+                keepWarmInterval = setInterval(() => {
+                    if (!isAnalyzing && !isRecording) {
+                        fetch('/api/transcribe', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ action: 'ping' })
+                        }).catch(() => {});
+                    }
+                }, 25000);
 
             } catch (err) {
                 statusEl.innerText = "Mic Permission Denied";
@@ -173,18 +292,32 @@
         }
 
         function encodeWAV(chunks, inputSampleRate) {
+            // Trim silent head & tail chunks so Whisper processes at maximum speed
+            let startIdx = 0;
+            while (startIdx < chunks.length - 4) {
+                const c = chunks[startIdx];
+                let peak = 0;
+                for (let i = 0; i < c.length; i++) {
+                    const a = Math.abs(c[i]);
+                    if (a > peak) peak = a;
+                }
+                if (peak * 140 < 6) startIdx++;
+                else break;
+            }
+            startIdx = Math.max(0, startIdx - 2);
+
             let endIdx = chunks.length;
-            while (endIdx > 4) {
+            while (endIdx > startIdx + 4) {
                 const c = chunks[endIdx - 1];
                 let peak = 0;
                 for (let i = 0; i < c.length; i++) {
                     const a = Math.abs(c[i]);
                     if (a > peak) peak = a;
                 }
-                if (peak * 140 < 6) endIdx--;
+                if (peak * 140 < 7) endIdx--;
                 else break;
             }
-            const trimmedChunks = chunks.slice(0, endIdx);
+            const trimmedChunks = chunks.slice(startIdx, endIdx);
 
             let totalLength = 0;
             for (const c of trimmedChunks) totalLength += c.length;
@@ -245,13 +378,16 @@
             recordedChunks = [];
 
             if (chunksToProcess.length === 0) {
-                resetToListening();
+                resetToListening(false);
                 return;
             }
 
             isAnalyzing = true;
             statusEl.innerText = "Analyzing...";
             statusEl.style.color = "#ffb86c";
+
+            // Instant pocket audio cue that speech capture finished and analysis started
+            playEarcon('captured');
 
             try {
                 const sampleRate = audioContext ? audioContext.sampleRate : 44100;
@@ -271,7 +407,7 @@
 
                 if (data.error) {
                     debugEl.innerText = `Error: ${data.error}`;
-                    resetToListening();
+                    resetToListening(true);
                     return;
                 }
 
@@ -283,11 +419,12 @@
                     debugEl.innerText = data.debugText;
                     resultEl.innerText = data.resultText;
                     resultEl.style.display = 'block';
+                    triggerHaptic([80, 40, 80]);
 
                     if (data.audio) {
                         playBase64Audio(data.audio);
                     } else {
-                        resetToListening();
+                        resetToListening(true);
                     }
                     return;
                 }
@@ -296,7 +433,7 @@
             } catch (e) {
                 isAnalyzing = false;
                 debugEl.innerText = "Connection error.";
-                resetToListening();
+                resetToListening(true);
             }
         }
 
@@ -313,21 +450,19 @@
         }
 
         function playAlert(type) {
-            let base64 = null;
-            let fallback = "";
-            
-            if (type === 'repeat') { base64 = cachedRepeatBase64; fallback = "Repeat."; }
-            else if (type === 'number') { base64 = cachedNumberBase64; fallback = "Number."; }
-            else if (type === 'card') { base64 = cachedCardBase64; fallback = "Card."; }
-            
-            if (base64) playBase64Audio(base64);
-            else speakFallback(fallback);
+            triggerHaptic([50]);
+            const buffer = alertBuffers[type];
+            if (buffer) {
+                playDecodedBuffer(buffer, true);
+            } else {
+                const fallbackMap = { repeat: "Repeat.", number: "Number.", card: "Card.", ready: "Ready." };
+                speakFallback(fallbackMap[type] || "Repeat.");
+            }
         }
 
         function handleUnresolvedSpeech(data) {
             const rawText = data.text || "";
 
-            // Card spoken first -> Request number
             if (data.card && !data.position) {
                 pendingCard = data.card;
                 const formatted = data.card.replace(/\b\w/g, c => c.toUpperCase());
@@ -337,7 +472,6 @@
                 return;
             }
 
-            // Position spoken first -> Request card
             if (!data.card && data.position) {
                 pendingPosition = data.position;
                 debugEl.innerText = `Locked Position: ${data.position} — Say card...`;
@@ -346,7 +480,6 @@
                 return;
             }
 
-            // Missed part of the suit/value
             if (data.partialCardAttempt) {
                 debugEl.innerText = `Missed card value: "${rawText}"`;
                 playAlert('repeat');
@@ -360,7 +493,33 @@
             } else {
                 debugEl.innerText = `Ignored chatter: "${rawText}"`;
             }
-            resetToListening();
+            resetToListening(false);
+        }
+
+        function playDecodedBuffer(decodedBuffer, playReadyBlipAfter = true) {
+            if (!audioContext || !decodedBuffer) {
+                resetToListening(playReadyBlipAfter);
+                return;
+            }
+            isSpeaking = true;
+            statusEl.innerText = "Speaking...";
+            statusEl.style.color = "#9d84ff";
+
+            speechFailSafeTimeout = setTimeout(() => {
+                resetToListening(playReadyBlipAfter);
+            }, 5000);
+
+            try {
+                const bufferSource = audioContext.createBufferSource();
+                bufferSource.buffer = decodedBuffer;
+                bufferSource.connect(audioContext.destination);
+                bufferSource.onended = () => {
+                    setTimeout(() => resetToListening(playReadyBlipAfter), 140);
+                };
+                bufferSource.start(0);
+            } catch (e) {
+                resetToListening(playReadyBlipAfter);
+            }
         }
 
         async function playBase64Audio(base64Audio) {
@@ -369,36 +528,21 @@
             statusEl.style.color = "#9d84ff";
 
             speechFailSafeTimeout = setTimeout(() => {
-                resetToListening();
+                resetToListening(true);
             }, 6000);
 
             try {
                 if (audioContext && audioContext.state !== 'running') {
                     await audioContext.resume().catch(() => {});
                 }
-
-                const binaryString = window.atob(base64Audio);
-                const len = binaryString.length;
-                const bytes = new Uint8Array(len);
-                for (let i = 0; i < len; i++) {
-                    bytes[i] = binaryString.charCodeAt(i);
+                const decodedBuffer = await decodeBase64ToBuffer(base64Audio);
+                if (decodedBuffer) {
+                    playDecodedBuffer(decodedBuffer, true);
+                } else {
+                    resetToListening(true);
                 }
-
-                audioContext.decodeAudioData(
-                    bytes.buffer,
-                    (decodedBuffer) => {
-                        const bufferSource = audioContext.createBufferSource();
-                        bufferSource.buffer = decodedBuffer;
-                        bufferSource.connect(audioContext.destination);
-                        bufferSource.onended = () => {
-                            setTimeout(resetToListening, 200);
-                        };
-                        bufferSource.start(0);
-                    },
-                    () => resetToListening()
-                );
             } catch (e) {
-                resetToListening();
+                resetToListening(true);
             }
         }
 
@@ -411,13 +555,13 @@
                 });
                 const data = await res.json();
                 if (data.audio) playBase64Audio(data.audio);
-                else resetToListening();
+                else resetToListening(true);
             } catch (e) {
-                resetToListening();
+                resetToListening(true);
             }
         }
 
-        function resetToListening() {
+        function resetToListening(emitBlip = false) {
             isSpeaking = false;
             isAnalyzing = false;
             clearTimeout(speechFailSafeTimeout);
@@ -426,6 +570,9 @@
             }
             statusEl.innerText = "Listening...";
             statusEl.style.color = "#a0a5b5";
+            if (emitBlip) {
+                playEarcon('listening');
+            }
         }
 
         function stopListening() {
@@ -433,6 +580,7 @@
             clearTimeout(maxRecordTimer);
             clearTimeout(speechFailSafeTimeout);
             clearTimeout(pendingTimer);
+            clearInterval(keepWarmInterval);
             if (processorNode) {
                 try { processorNode.disconnect(); } catch (e) {}
                 processorNode = null;
@@ -448,6 +596,7 @@
             isRecording = false;
             isSpeaking = false;
             isAnalyzing = false;
+            hasAnnouncedReady = false;
             statusEl.innerText = "Paused";
         }
 
