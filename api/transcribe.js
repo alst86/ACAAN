@@ -99,7 +99,7 @@ async function generateTTSBase64(text) {
             input: text,
             voice: 'onyx',
             response_format: 'mp3',
-            speed: 1.18
+            speed: 1.22
         })
     });
     if (!ttsResponse.ok) return null;
@@ -113,13 +113,30 @@ export default async function handler(req, res) {
     }
     
     try {
-        // Standalone TTS fallback
+        // 1. Instant Keep-Warm Ping (Prevents Vercel cold starts in pocket)
+        if (req.body.action === 'ping') {
+            return res.status(200).json({ ok: true });
+        }
+
+        // 2. Parallel Batch Preload for All Pocket Voice Alerts
+        if (req.body.action === 'init_alerts') {
+            const [ready, repeat, number, card] = await Promise.all([
+                generateTTSBase64("Ready."),
+                generateTTSBase64("Repeat."),
+                generateTTSBase64("Number."),
+                generateTTSBase64("Card.")
+            ]);
+            return res.status(200).json({ ready, repeat, number, card });
+        }
+
+        // 3. Single TTS Fallback
         if (req.body.action === 'tts') {
             const base64Audio = await generateTTSBase64(req.body.text);
             if (!base64Audio) return res.status(500).json({ error: "TTS failed" });
             return res.status(200).json({ audio: base64Audio });
         }
 
+        // 4. Ultra-Fast Speech-to-Text + Single-Trip Cut Calculation
         const base64Audio = req.body.audio;
         if (!base64Audio) {
             return res.status(400).json({ error: "No audio received" });
@@ -134,7 +151,8 @@ export default async function handler(req, res) {
         formData.append('model', 'whisper-1');
         formData.append('language', 'en');
         formData.append('temperature', '0');
-        formData.append('prompt', 'Singapore and Malaysia English ACAAN trick. Ace, 2, two, 3, three, 4, four, 5, five, 6, six, 7, seven, 8, eight, 9, nine, 10, ten, Jack, Queen, King of Clubs, Clovers, Flowers, Hearts, Spades, Diamonds. Position number 1 to 52.');
+        // Concise prompt for faster token decoding
+        formData.append('prompt', 'Ace, 2, 3, 4, 5, 6, 7, 8, 9, 10, Jack, Queen, King of Clubs, Clovers, Flowers, Hearts, Spades, Diamonds. 1 to 52.');
         
         const aiResponse = await fetch('https://api.openai.com/v1/audio/transcriptions', {
             method: 'POST',
@@ -155,7 +173,6 @@ export default async function handler(req, res) {
         const finalCard = card || req.body.pendingCard || null;
         const finalPosition = position || req.body.pendingPosition || null;
 
-        // If both Card and Position are ready, generate TTS immediately in the same server call!
         if (finalCard && finalPosition) {
             const cardIndex = stack.indexOf(finalCard);
             const currentPosition = cardIndex + 1;
