@@ -7,63 +7,97 @@ const stack = [
     "ace of hearts", "9 of diamonds"
 ];
 
-function extractElements(rawText) {
+function extractElementsRegex(rawText) {
     const cleanRaw = (rawText || "").trim();
     if (
         cleanRaw.length < 1 ||
         /^(you|thank you|thanks|bye|okay|oh|uh|um)$/i.test(cleanRaw) ||
         /thank you for|watching|joining|subtitles|amara\.org/i.test(cleanRaw)
     ) {
-        return { card: null, position: null, partialCardAttempt: false };
+        return { card: null, position: null, partialCardAttempt: false, isNoise: true };
     }
 
     let text = cleanRaw.toLowerCase().replace(/[.,!?-]/g, ' ').replace(/\s+/g, ' ').trim();
 
+    // Normalize common SG/MY phonetic variations & ordinals
     const wordToNum = {
-        'one': '1', 'two': '2', 'to': '2', 'too': '2', 'three': '3', 'tree': '3',
-        'four': '4', 'for': '4', 'ford': '4', 'five': '5', 'six': '6', 'seven': '7',
-        'eight': '8', 'ate': '8', 'nine': '9', 'ten': '10',
+        'first': '1', 'second': '2', 'third': '3', 'fourth': '4', 'fifth': '5',
+        'sixth': '6', 'seventh': '7', 'eighth': '8', 'ninth': '9', 'tenth': '10',
+        'one': '1', 'won': '1', 'two': '2', 'to': '2', 'too': '2', 'tu': '2',
+        'three': '3', 'tree': '3', 'free': '3', 'four': '4', 'for': '4', 'fore': '4', 'ford': '4',
+        'five': '5', 'fife': '5', 'six': '6', 'sex': '6', 'seven': '7',
+        'eight': '8', 'ate': '8', 'nine': '9', 'night': '9', 'ten': '10', 'tin': '10',
         'eleven': '11', 'twelve': '12', 'thirteen': '13', 'fourteen': '14', 'fifteen': '15',
-        'sixteen': '16', 'seventeen': '17', 'eighteen': '18', 'nineteen': '19', 'twenty': '20',
-        'thirty': '30', 'forty': '40', 'fifty': '50'
+        'sixteen': '16', 'seventeen': '17', 'eighteen': '18', 'nineteen': '19',
+        'twenty': '20', 'thirty': '30', 'dirty': '30', 'forty': '40', 'fourty': '40', 'fifty': '50'
     };
 
     for (const [w, n] of Object.entries(wordToNum)) {
         text = text.replace(new RegExp(`\\b${w}\\b`, 'g'), n);
     }
-    text = text.replace(/\b(20|30|40|50)\s+([1-9])\b/g, (m, tens, ones) => String(parseInt(tens) + parseInt(ones)));
-    text = text.replace(/\b1\s+(?:2|to)\s+52\b/g, ' ').replace(/\b52\s+cards?\b/g, ' ');
 
-    const hasSuitKeyword = /\b(clubs?|clovers?|flowers?|hearts?|spades?|diamonds?)\b/.test(text);
+    // Strip ordinal suffixes from digits (e.g. "21st" -> "21", "36th" -> "36")
+    text = text.replace(/\b(\d+)(?:st|nd|rd|th)\b/g, '$1');
+
+    // Combine compound numbers ("20 5" -> "25")
+    text = text.replace(/\b(20|30|40|50)\s+([1-9])\b/g, (m, tens, ones) => String(parseInt(tens, 10) + parseInt(ones, 10)));
+
+    // Strip magician patter phrases ("1 to 52", "52 cards")
+    text = text.replace(/\b1\s+(?:2|to|until|through)\s+52\b/g, ' ')
+               .replace(/\b52\s+cards?\b/g, ' ');
+
+    // Normalize phonetic suit & face mishearings
+    text = text
+        .replace(/\b(clovers?|flowers?|claps?|klubs?|cups?|pupp(?:y|ies))\b/g, 'clubs')
+        .replace(/\b(harts?|hards?|hurts?|arts?)\b/g, 'hearts')
+        .replace(/\b(space|speeds?|speaks?|states?|paid|spits?)\b/g, 'spades')
+        .replace(/\b(dimonds?|daimonds?|demons?)\b/g, 'diamonds')
+        .replace(/\b(ays|is|his|eight\s+of\s+spades)\b/g, (m) => m.startsWith('eight') ? m : 'ace')
+        .replace(/\b(jacks?|check|jak)\b/g, 'jack')
+        .replace(/\b(queens?|quin|clean|green)\b/g, 'queen')
+        .replace(/\b(kings?|kin)\b/g, 'king');
+
+    const suitRegex = /\b(clubs?|hearts?|spades?|diamonds?)\b/;
+    const hasSuitKeyword = suitRegex.test(text);
     const hasFaceKeyword = /\b(ace|jack|queen|king)\b/.test(text);
 
     let detectedCard = null;
     let remainingText = text;
 
     if (hasSuitKeyword) {
-        const pairedCardRegex = /\b(ace|jack|queen|king|10|[2-9])(?:\s+(?:of|in|on|at|4|2))?\s+(clubs?|clovers?|flowers?|hearts?|spades?|diamonds?)\b/;
+        // 1. Look for Value + Suit paired together ("10 of spades", "queen spades", "4 clubs")
+        const pairedCardRegex = /\b(ace|1|jack|queen|king|10|[2-9])(?:\s+(?:of|in|on|at|a|the|4|2))?\s+(clubs?|hearts?|spades?|diamonds?)\b/;
         const pairedMatch = text.match(pairedCardRegex);
 
         let value = null;
         let rawSuit = null;
 
         if (pairedMatch) {
-            value = pairedMatch[1];
+            value = pairedMatch[1] === '1' ? 'ace' : pairedMatch[1];
             rawSuit = pairedMatch[2];
             remainingText = text.replace(pairedMatch[0], ' ');
         } else {
-            const suitMatch = text.match(/\b(clubs?|clovers?|flowers?|hearts?|spades?|diamonds?)\b/);
-            const valueMatch = text.match(/\b(ace|jack|queen|king|10|[2-9])\b/);
-            if (suitMatch && valueMatch) {
-                value = valueMatch[1];
-                rawSuit = suitMatch[1];
-                remainingText = text.replace(valueMatch[0], ' ').replace(suitMatch[0], ' ');
+            // 2. Look for reversed Suit + Value ("spades 10", "clubs queen")
+            const reverseCardRegex = /\b(clubs?|hearts?|spades?|diamonds?)\s+(?:of\s+)?(ace|1|jack|queen|king|10|[2-9])\b/;
+            const reverseMatch = text.match(reverseCardRegex);
+            if (reverseMatch) {
+                rawSuit = reverseMatch[1];
+                value = reverseMatch[2] === '1' ? 'ace' : reverseMatch[2];
+                remainingText = text.replace(reverseMatch[0], ' ');
+            } else {
+                const suitMatch = text.match(suitRegex);
+                const valueMatch = text.match(/\b(ace|1|jack|queen|king|10|[2-9])\b/);
+                if (suitMatch && valueMatch) {
+                    value = valueMatch[1] === '1' ? 'ace' : valueMatch[1];
+                    rawSuit = suitMatch[1];
+                    remainingText = text.replace(valueMatch[0], ' ').replace(suitMatch[0], ' ');
+                }
             }
         }
 
         if (value && rawSuit) {
             let suit = rawSuit;
-            if (suit.startsWith('club') || suit.startsWith('clover') || suit.startsWith('flower')) suit = 'clubs';
+            if (suit.startsWith('club')) suit = 'clubs';
             else if (suit.startsWith('heart')) suit = 'hearts';
             else if (suit.startsWith('spade')) suit = 'spades';
             else if (suit.startsWith('diamond')) suit = 'diamonds';
@@ -83,8 +117,54 @@ function extractElements(rawText) {
     return {
         card: detectedCard,
         position: detectedPosition,
-        partialCardAttempt: (hasSuitKeyword || hasFaceKeyword) && !detectedCard
+        partialCardAttempt: (hasSuitKeyword || hasFaceKeyword) && !detectedCard,
+        isNoise: false
     };
+}
+
+// Layer 2: Fast GPT-4o-mini semantic rescue if noisy room garbled the Whisper transcript
+async function extractElementsWithLLM(rawText, pendingCard, pendingPosition) {
+    try {
+        const res = await fetch('https://api.openai.com/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                model: 'gpt-4o-mini',
+                temperature: 0,
+                max_tokens: 60,
+                response_format: { type: 'json_object' },
+                messages: [
+                    {
+                        role: 'system',
+                        content: `You extract a playing card and a stack position number (1 to 52) from noisy speech transcriptions in Singapore/Malaysia English.
+Valid card format: "<value> of <suit>" in lowercase, where <value> is ace, 2, 3, 4, 5, 6, 7, 8, 9, 10, jack, queen, king and <suit> is clubs, hearts, spades, diamonds.
+Note phonetic sound-alikes: "clovers"/"flowers"/"claps" = clubs, "space"/"speeds" = spades, "harts"/"hard" = hearts, "for" = 4, "tree" = 3, "ate" = 8, "dirty" = 30.
+Ignore magician patter like "1 to 52" or "52 cards".
+Return ONLY JSON: {"card": "queen of clubs" or null, "position": 45 or null, "partialCardAttempt": true/false}`
+                    },
+                    {
+                        role: 'user',
+                        content: `Transcript: "${rawText}" (Previously locked card: ${pendingCard || 'none'}, locked position: ${pendingPosition || 'none'})`
+                    }
+                ]
+            })
+        });
+        if (!res.ok) return null;
+        const data = await res.json();
+        const parsed = JSON.parse(data.choices?.[0]?.message?.content || '{}');
+        const validCard = (parsed.card && stack.includes(parsed.card.toLowerCase())) ? parsed.card.toLowerCase() : null;
+        const validPos = (Number.isInteger(parsed.position) && parsed.position >= 1 && parsed.position <= 52) ? parsed.position : null;
+        return {
+            card: validCard,
+            position: validPos,
+            partialCardAttempt: Boolean(parsed.partialCardAttempt) && !validCard
+        };
+    } catch (e) {
+        return null;
+    }
 }
 
 async function generateTTSBase64(text) {
@@ -99,7 +179,7 @@ async function generateTTSBase64(text) {
             input: text,
             voice: 'onyx',
             response_format: 'mp3',
-            speed: 1.22
+            speed: 1.2
         })
     });
     if (!ttsResponse.ok) return null;
@@ -113,12 +193,10 @@ export default async function handler(req, res) {
     }
     
     try {
-        // 1. Instant Keep-Warm Ping (Prevents Vercel cold starts in pocket)
         if (req.body.action === 'ping') {
             return res.status(200).json({ ok: true });
         }
 
-        // 2. Parallel Batch Preload for All Pocket Voice Alerts
         if (req.body.action === 'init_alerts') {
             const [ready, repeat, number, card] = await Promise.all([
                 generateTTSBase64("Ready."),
@@ -129,14 +207,12 @@ export default async function handler(req, res) {
             return res.status(200).json({ ready, repeat, number, card });
         }
 
-        // 3. Single TTS Fallback
         if (req.body.action === 'tts') {
             const base64Audio = await generateTTSBase64(req.body.text);
             if (!base64Audio) return res.status(500).json({ error: "TTS failed" });
             return res.status(200).json({ audio: base64Audio });
         }
 
-        // 4. Ultra-Fast Speech-to-Text + Single-Trip Cut Calculation
         const base64Audio = req.body.audio;
         if (!base64Audio) {
             return res.status(400).json({ error: "No audio received" });
@@ -151,8 +227,7 @@ export default async function handler(req, res) {
         formData.append('model', 'whisper-1');
         formData.append('language', 'en');
         formData.append('temperature', '0');
-        // Concise prompt for faster token decoding
-        formData.append('prompt', 'Ace, 2, 3, 4, 5, 6, 7, 8, 9, 10, Jack, Queen, King of Clubs, Clovers, Flowers, Hearts, Spades, Diamonds. 1 to 52.');
+        formData.append('prompt', 'Singapore and Malaysia English card magic trick. Ace, two, three, four, five, six, seven, eight, nine, ten, Jack, Queen, King of Clubs, Clovers, Flowers, Hearts, Spades, Diamonds. Position number 1 to 52.');
         
         const aiResponse = await fetch('https://api.openai.com/v1/audio/transcriptions', {
             method: 'POST',
@@ -167,8 +242,33 @@ export default async function handler(req, res) {
             return res.status(500).json({ error: data.error.message });
         }
 
-        const rawText = data.text || "";
-        const { card, position, partialCardAttempt } = extractElements(rawText);
+        const rawText = (data.text || "").trim();
+        const combinedText = req.body.previousTranscript
+            ? `${req.body.previousTranscript} ${rawText}`.trim()
+            : rawText;
+
+        // 1. Run instant Regex + Phonetic parser first
+        let { card, position, partialCardAttempt, isNoise } = extractElementsRegex(rawText);
+
+        // 2. If incomplete on single breath, check combined rolling transcript
+        if ((!card || !position) && req.body.previousTranscript && !isNoise) {
+            const combo = extractElementsRegex(combinedText);
+            if (!card && combo.card) card = combo.card;
+            if (!position && combo.position) position = combo.position;
+        }
+
+        // 3. If still incomplete and real speech was heard, run GPT-4o-mini smart rescue
+        const tentativeCard = card || req.body.pendingCard || null;
+        const tentativePos = position || req.body.pendingPosition || null;
+
+        if ((!tentativeCard || !tentativePos) && !isNoise && rawText.length > 2) {
+            const llmResult = await extractElementsWithLLM(combinedText, req.body.pendingCard, req.body.pendingPosition);
+            if (llmResult) {
+                if (!card && llmResult.card) card = llmResult.card;
+                if (!position && llmResult.position) position = llmResult.position;
+                if (llmResult.partialCardAttempt) partialCardAttempt = true;
+            }
+        }
 
         const finalCard = card || req.body.pendingCard || null;
         const finalPosition = position || req.body.pendingPosition || null;
