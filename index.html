@@ -24,22 +24,6 @@
         #status { font-size: 1.2rem; margin-top: 20px; color: #a0a5b5; transition: color 0.1s; }
         #debug { font-size: 0.9rem; margin-top: 10px; color: #777; font-style: italic; min-height: 24px; padding: 0 20px; }
         #result { font-size: 1.4rem; margin-top: 30px; font-weight: bold; color: #ffffff; padding: 20px; border-radius: 10px; background: #232533; display: none; width: 80%; }
-        #mode-toggle {
-            margin-top: 28px;
-            padding: 10px 18px;
-            border-radius: 20px;
-            border: 1px solid #3b3e52;
-            background: #181b28;
-            color: #a0a5b5;
-            font-size: 0.8rem;
-            font-weight: 600;
-            letter-spacing: 0.5px;
-        }
-        #mode-toggle.active {
-            border-color: #50fa7b;
-            color: #50fa7b;
-            background: rgba(80, 250, 123, 0.12);
-        }
         #app-content { display: flex; flex-direction: column; align-items: center; width: 100%; }
         #haptic-wrap { position: absolute; opacity: 0; pointer-events: none; width: 1px; height: 1px; overflow: hidden; }
     </style>
@@ -56,18 +40,13 @@
         <div id="status">Initializing...</div>
         <div id="debug">Speak card and position</div>
         <div id="result"></div>
-        <button id="mode-toggle" class="active">🎥 META SIMULTANEOUS REC: ON</button>
     </div>
 
     <script>
         const statusEl = document.getElementById('status');
         const debugEl = document.getElementById('debug');
         const resultEl = document.getElementById('result');
-        const modeToggleBtn = document.getElementById('mode-toggle');
         const hapticLabel = document.getElementById('haptic-label');
-
-        // Simultaneous Mode: Locks onto iPhone built-in mic (or covert earpiece) & never triggers Meta HFP call lock
-        let metaSimultaneousMode = true;
 
         let isSpeaking = false;
         let isAnalyzing = false;
@@ -82,13 +61,15 @@
         let silenceTimer = null;
         let maxRecordTimer = null;
 
+        // 0.75s Pre-Roll so the first syllable of a card is never clipped
         let preRollChunks = [];
         let recordedChunks = [];
-        const PRE_ROLL_MAX_CHUNKS = 6; 
-        let utterancePeak = 0;
+        const PRE_ROLL_MAX_CHUNKS = 8; 
 
+        // Two-way memory + rolling transcript memory
         let pendingCard = null;
         let pendingPosition = null;
+        let previousTranscript = "";
         let pendingTimer = null;
 
         const alertBuffers = {
@@ -97,26 +78,6 @@
             number: null,
             card: null
         };
-
-        modeToggleBtn.addEventListener('click', async (e) => {
-            e.stopPropagation();
-            metaSimultaneousMode = !metaSimultaneousMode;
-            modeToggleBtn.className = metaSimultaneousMode ? 'active' : '';
-            modeToggleBtn.innerText = metaSimultaneousMode
-                ? '🎥 META SIMULTANEOUS REC: ON'
-                : '🎥 META SIMULTANEOUS REC: OFF';
-            triggerHaptic([40]);
-            stopListening();
-            await startListening(true);
-        });
-
-        function setIOSAudioSession(type) {
-            try {
-                if (navigator.audioSession) {
-                    navigator.audioSession.type = type;
-                }
-            } catch (e) {}
-        }
 
         function triggerHaptic(pattern = [60]) {
             try {
@@ -160,8 +121,7 @@
             } catch (e) {}
         }
 
-        function unlockAudioContext(e) {
-            if (e && e.target === modeToggleBtn) return;
+        function unlockAudioContext() {
             triggerHaptic([40]);
             if (!audioContext) return;
             if (audioContext.state !== 'running') {
@@ -173,6 +133,7 @@
             }
         }
         document.body.addEventListener('touchstart', unlockAudioContext, { passive: true });
+        document.body.addEventListener('touchend', unlockAudioContext, { passive: true });
         document.body.addEventListener('click', unlockAudioContext);
 
         async function decodeBase64ToBuffer(base64) {
@@ -227,85 +188,22 @@
             }
         }
 
-        // Acquires mic WITHOUT activating Ray-Ban Meta Bluetooth HFP Call Mode
-        async function getNonBlockingAudioStream() {
-            if (!metaSimultaneousMode) {
-                setIOSAudioSession('play-and-record');
-                return await navigator.mediaDevices.getUserMedia({ audio: true });
-            }
-
-            // 'auto' prevents iOS from forcing Bluetooth HFP Call Mode on the Meta glasses
-            setIOSAudioSession('auto');
-
-            const savedIphoneMicId = localStorage.getItem('acaan_iphone_mic_id');
-            if (savedIphoneMicId) {
-                try {
-                    return await navigator.mediaDevices.getUserMedia({
-                        audio: { deviceId: { exact: savedIphoneMicId } }
-                    });
-                } catch (e) {
-                    localStorage.removeItem('acaan_iphone_mic_id');
-                }
-            }
-
-            let stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-
-            if (navigator.mediaDevices.enumerateDevices) {
-                try {
-                    const devices = await navigator.mediaDevices.enumerateDevices();
-                    // Prefer a covert earpiece if connected, otherwise lock onto built-in iPhone Microphone
-                    // and explicitly avoid Ray-Ban Meta's built-in HFP mic
-                    const nonMetaMic = devices.find(d =>
-                        d.kind === 'audioinput' &&
-                        !/ray-ban|meta|rb\s*meta/i.test(d.label) &&
-                        /iphone|built-in|internal|bottom|front|back|airpod|earpiece|headset/i.test(d.label)
-                    );
-
-                    if (nonMetaMic && nonMetaMic.deviceId) {
-                        localStorage.setItem('acaan_iphone_mic_id', nonMetaMic.deviceId);
-                        const currentTrack = stream.getAudioTracks()[0];
-                        if (!currentTrack || currentTrack.label !== nonMetaMic.label) {
-                            const cleanStream = await navigator.mediaDevices.getUserMedia({
-                                audio: { deviceId: { exact: nonMetaMic.deviceId } }
-                            });
-                            stream.getTracks().forEach(t => t.stop());
-                            stream = cleanStream;
-                        }
-                    }
-                } catch (e) {}
-            }
-
-            // Reset session to auto so Meta glasses stay free to record video continuously
-            setIOSAudioSession('playback');
-            setIOSAudioSession('auto');
-            return stream;
-        }
-
-        async function startListening(isRewake = false) {
+        async function startListening() {
             if (audioStream) return; 
 
             try {
-                audioStream = await getNonBlockingAudioStream();
-                if (!audioContext || audioContext.state === 'closed') {
-                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                }
-                if (audioContext.state !== 'running') {
-                    await audioContext.resume().catch(() => {});
-                }
-
+                // Direct, uninterrupted microphone stream for maximum accuracy
+                audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
                 const sourceNode = audioContext.createMediaStreamSource(audioStream);
-                processorNode = audioContext.createScriptProcessor(1024, 1, 1);
+
+                processorNode = audioContext.createScriptProcessor(2048, 1, 1);
                 const silentGain = audioContext.createGain();
                 silentGain.gain.value = 0;
 
                 sourceNode.connect(processorNode);
                 processorNode.connect(silentGain);
                 silentGain.connect(audioContext.destination);
-
-                const activeMicLabel = audioStream.getAudioTracks()[0]?.label || "Mic active";
-                if (!pendingCard && !pendingPosition) {
-                    debugEl.innerText = `Mic: ${activeMicLabel}`;
-                }
 
                 processorNode.onaudioprocess = (e) => {
                     if (isSpeaking || isAnalyzing) return;
@@ -319,7 +217,7 @@
                         if (abs > maxPeak) maxPeak = abs;
                     }
                     const displayLevel = Math.min(99, Math.round(maxPeak * 140));
-                    const START_THRESHOLD = 8;
+                    const SPEECH_THRESHOLD = 7;
 
                     if (!isRecording) {
                         preRollChunks.push(chunkCopy);
@@ -328,10 +226,13 @@
                         }
                         statusEl.innerText = `Listening... (${displayLevel})`;
                         statusEl.style.color = "#a0a5b5";
+                    } else {
+                        recordedChunks.push(chunkCopy);
+                    }
 
-                        if (displayLevel > START_THRESHOLD) {
+                    if (displayLevel > SPEECH_THRESHOLD) {
+                        if (!isRecording) {
                             isRecording = true;
-                            utterancePeak = displayLevel;
                             recordedChunks = [...preRollChunks, chunkCopy];
                             preRollChunks = [];
                             statusEl.innerText = "Recording...";
@@ -341,35 +242,20 @@
 
                             maxRecordTimer = setTimeout(() => {
                                 if (isRecording) finishRecordingAndTranscribe();
-                            }, 3200);
-
-                            clearTimeout(silenceTimer);
-                            silenceTimer = setTimeout(() => {
-                                if (isRecording) finishRecordingAndTranscribe();
-                            }, 460);
-                        }
-                    } else {
-                        recordedChunks.push(chunkCopy);
-                        if (displayLevel > utterancePeak) {
-                            utterancePeak = displayLevel;
+                            }, 5000);
                         }
 
-                        const dynamicContinueThreshold = Math.max(8, Math.min(18, Math.round(utterancePeak * 0.35)));
-
-                        if (displayLevel > dynamicContinueThreshold) {
-                            clearTimeout(silenceTimer);
-                            silenceTimer = setTimeout(() => {
-                                if (isRecording) finishRecordingAndTranscribe();
-                            }, 460);
-                        }
+                        clearTimeout(silenceTimer);
+                        // 1.15s pause window: fast, yet never cuts off natural pauses between Card and Position
+                        silenceTimer = setTimeout(() => {
+                            if (isRecording) finishRecordingAndTranscribe();
+                        }, 1150);
                     }
                 };
 
-                resetToListening(isRewake);
-                if (!isRewake) {
-                    announceReadyOnce();
-                    preloadAlerts();
-                }
+                resetToListening(false);
+                announceReadyOnce();
+                preloadAlerts();
 
                 clearInterval(keepWarmInterval);
                 keepWarmInterval = setInterval(() => {
@@ -387,43 +273,18 @@
             }
         }
 
+        // Crisp 16kHz anti-aliased WAV encoding (Whisper's native sample rate for 100% consonant clarity)
         function encodeWAV(chunks, inputSampleRate) {
-            let startIdx = 0;
-            while (startIdx < chunks.length - 4) {
-                const c = chunks[startIdx];
-                let peak = 0;
-                for (let i = 0; i < c.length; i++) {
-                    const a = Math.abs(c[i]);
-                    if (a > peak) peak = a;
-                }
-                if (peak * 140 < 6) startIdx++;
-                else break;
-            }
-            startIdx = Math.max(0, startIdx - 2);
-
-            let endIdx = chunks.length;
-            while (endIdx > startIdx + 4) {
-                const c = chunks[endIdx - 1];
-                let peak = 0;
-                for (let i = 0; i < c.length; i++) {
-                    const a = Math.abs(c[i]);
-                    if (a > peak) peak = a;
-                }
-                if (peak * 140 < 7) endIdx--;
-                else break;
-            }
-            const trimmedChunks = chunks.slice(startIdx, endIdx);
-
             let totalLength = 0;
-            for (const c of trimmedChunks) totalLength += c.length;
+            for (const c of chunks) totalLength += c.length;
             const merged = new Float32Array(totalLength);
             let offset = 0;
-            for (const c of trimmedChunks) {
+            for (const c of chunks) {
                 merged.set(c, offset);
                 offset += c.length;
             }
 
-            const targetRate = 8000;
+            const targetRate = 16000;
             const ratio = inputSampleRate / targetRate;
             const newLength = Math.round(merged.length / ratio);
             const buffer = new ArrayBuffer(44 + newLength * 2);
@@ -449,8 +310,17 @@
 
             let outOffset = 44;
             for (let i = 0; i < newLength; i++) {
-                const sampleIndex = Math.min(merged.length - 1, Math.floor(i * ratio));
-                const s = Math.max(-1, Math.min(1, merged[sampleIndex]));
+                // Boxcar averaging prevents high-frequency aliasing on "s", "f", and "th"
+                const start = Math.floor(i * ratio);
+                const end = Math.min(merged.length, Math.ceil((i + 1) * ratio));
+                let sum = 0;
+                let count = 0;
+                for (let j = start; j < end; j++) {
+                    sum += merged[j];
+                    count++;
+                }
+                const sample = count > 0 ? sum / count : merged[Math.min(merged.length - 1, start)];
+                const s = Math.max(-1, Math.min(1, sample));
                 view.setInt16(outOffset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
                 outOffset += 2;
             }
@@ -493,7 +363,8 @@
                     body: JSON.stringify({
                         audio: base64Wav,
                         pendingCard: pendingCard,
-                        pendingPosition: pendingPosition
+                        pendingPosition: pendingPosition,
+                        previousTranscript: previousTranscript
                     })
                 });
                 const data = await res.json();
@@ -509,6 +380,7 @@
                     clearTimeout(pendingTimer);
                     pendingCard = null;
                     pendingPosition = null;
+                    previousTranscript = "";
 
                     debugEl.innerText = data.debugText;
                     resultEl.innerText = data.resultText;
@@ -537,10 +409,11 @@
                 if (pendingCard || pendingPosition) {
                     pendingCard = null;
                     pendingPosition = null;
+                    previousTranscript = "";
                     debugEl.innerText = "Timed out waiting for second part.";
                     playAlert('repeat');
                 }
-            }, 12000);
+            }, 15000);
         }
 
         function playAlert(type) {
@@ -555,7 +428,11 @@
         }
 
         function handleUnresolvedSpeech(data) {
-            const rawText = data.text || "";
+            const rawText = (data.text || "").trim();
+
+            if (rawText.length > 1) {
+                previousTranscript = rawText;
+            }
 
             if (data.card && !data.position) {
                 pendingCard = data.card;
@@ -599,23 +476,16 @@
             statusEl.innerText = "Speaking...";
             statusEl.style.color = "#9d84ff";
 
-            // Temporarily route TTS over A2DP media playback so it never triggers HFP Call Mode
-            if (metaSimultaneousMode) {
-                setIOSAudioSession('playback');
-            }
-
             speechFailSafeTimeout = setTimeout(() => {
                 resetToListening(playReadyBlipAfter);
-            }, 5500);
+            }, 6000);
 
             try {
                 const bufferSource = audioContext.createBufferSource();
                 bufferSource.buffer = decodedBuffer;
                 bufferSource.connect(audioContext.destination);
                 bufferSource.onended = () => {
-                    setTimeout(() => {
-                        resetToListening(playReadyBlipAfter);
-                    }, 160);
+                    setTimeout(() => resetToListening(playReadyBlipAfter), 180);
                 };
                 bufferSource.start(0);
             } catch (e) {
@@ -630,7 +500,7 @@
 
             speechFailSafeTimeout = setTimeout(() => {
                 resetToListening(true);
-            }, 6000);
+            }, 6500);
 
             try {
                 if (audioContext && audioContext.state !== 'running') {
@@ -666,9 +536,6 @@
             isSpeaking = false;
             isAnalyzing = false;
             clearTimeout(speechFailSafeTimeout);
-            if (metaSimultaneousMode) {
-                setIOSAudioSession('auto');
-            }
             if (audioContext && audioContext.state !== 'running') {
                 audioContext.resume().catch(() => {});
             }
@@ -704,13 +571,13 @@
             statusEl.innerText = "Paused";
         }
 
-        window.addEventListener('load', () => startListening(false));
+        window.addEventListener('load', startListening);
 
         document.addEventListener('visibilitychange', () => {
             if (document.hidden) {
                 stopListening();
             } else {
-                startListening(false);
+                startListening();
             }
         });
     </script>
