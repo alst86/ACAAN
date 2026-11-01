@@ -21,7 +21,7 @@
             user-select: none;
         }
         h1 { color: #9d84ff; font-size: 2rem; margin-bottom: 10px; }
-        #status { font-size: 1.2rem; margin-top: 20px; color: #a0a5b5; transition: color 0.1s; }
+        #status { font-size: 1.3rem; font-weight: 600; margin-top: 20px; color: #50fa7b; transition: color 0.1s; }
         #debug { font-size: 0.9rem; margin-top: 10px; color: #777; font-style: italic; min-height: 24px; padding: 0 20px; }
         #result { font-size: 1.4rem; margin-top: 30px; font-weight: bold; color: #ffffff; padding: 20px; border-radius: 10px; background: #232533; display: none; width: 80%; }
         #app-content { display: flex; flex-direction: column; align-items: center; width: 100%; }
@@ -38,7 +38,7 @@
     <div id="app-content">
         <h1>ACAAN</h1>
         <div id="status">Initializing...</div>
-        <div id="debug">Speak card and position</div>
+        <div id="debug">Tap screen once to arm earpiece</div>
         <div id="result"></div>
     </div>
 
@@ -54,6 +54,8 @@
         let hasAnnouncedReady = false;
         let speechFailSafeTimeout = null;
         let keepWarmInterval = null;
+        let micCooldownUntil = 0;
+        let lastTouchTime = 0;
         
         let audioContext = null;
         let audioStream = null;
@@ -61,10 +63,12 @@
         let silenceTimer = null;
         let maxRecordTimer = null;
 
-        // 0.75s Pre-Roll so the first syllable of a card is never clipped
+        // 0.75s Pre-Roll so the first word is never clipped
         let preRollChunks = [];
         let recordedChunks = [];
         const PRE_ROLL_MAX_CHUNKS = 8; 
+        let consecutiveLoudChunks = 0;
+        let activeSpeechChunksCount = 0;
 
         // Two-way memory + rolling transcript memory
         let pendingCard = null;
@@ -86,55 +90,25 @@
             } catch (e) {}
         }
 
-        function playEarcon(type) {
-            if (!audioContext || audioContext.state !== 'running') return;
-            try {
-                const now = audioContext.currentTime;
-                const osc = audioContext.createOscillator();
-                const gain = audioContext.createGain();
-                osc.connect(gain);
-                gain.connect(audioContext.destination);
+        // Single tap anywhere wakes audio or whispers current readiness state in pocket
+        function handleScreenTap() {
+            const now = Date.now();
+            if (now - lastTouchTime < 400) return; // Prevent double firing from touchstart + click
+            lastTouchTime = now;
 
-                if (type === 'ready') {
-                    osc.type = 'sine';
-                    osc.frequency.setValueAtTime(660, now);
-                    osc.frequency.setValueAtTime(880, now + 0.09);
-                    gain.gain.setValueAtTime(0.18, now);
-                    gain.gain.exponentialRampToValueAtTime(0.01, now + 0.22);
-                    osc.start(now);
-                    osc.stop(now + 0.23);
-                } else if (type === 'listening') {
-                    osc.type = 'sine';
-                    osc.frequency.setValueAtTime(784, now);
-                    gain.gain.setValueAtTime(0.09, now);
-                    gain.gain.exponentialRampToValueAtTime(0.005, now + 0.05);
-                    osc.start(now);
-                    osc.stop(now + 0.055);
-                } else if (type === 'captured') {
-                    osc.type = 'triangle';
-                    osc.frequency.setValueAtTime(420, now);
-                    gain.gain.setValueAtTime(0.12, now);
-                    gain.gain.exponentialRampToValueAtTime(0.005, now + 0.04);
-                    osc.start(now);
-                    osc.stop(now + 0.045);
-                }
-            } catch (e) {}
-        }
-
-        function unlockAudioContext() {
             triggerHaptic([40]);
             if (!audioContext) return;
+
             if (audioContext.state !== 'running') {
                 audioContext.resume().then(() => {
-                    announceReadyOnce();
+                    announceReadyState(true);
                 }).catch(() => {});
             } else {
-                announceReadyOnce();
+                announceReadyState(true);
             }
         }
-        document.body.addEventListener('touchstart', unlockAudioContext, { passive: true });
-        document.body.addEventListener('touchend', unlockAudioContext, { passive: true });
-        document.body.addEventListener('click', unlockAudioContext);
+        document.body.addEventListener('touchstart', handleScreenTap, { passive: true });
+        document.body.addEventListener('click', handleScreenTap);
 
         async function decodeBase64ToBuffer(base64) {
             if (!base64 || !audioContext) return null;
@@ -173,18 +147,31 @@
                 alertBuffers.card = cardBuf;
 
                 if (!hasAnnouncedReady && audioContext && audioContext.state === 'running') {
-                    announceReadyOnce();
+                    announceReadyState(false);
                 }
             } catch (e) {}
         }
 
-        function announceReadyOnce() {
-            if (hasAnnouncedReady || !audioContext || audioContext.state !== 'running') return;
-            hasAnnouncedReady = true;
-            triggerHaptic([70, 50, 70]);
-            playEarcon('ready');
+        function announceReadyState(isManualTap = false) {
+            if (!audioContext || audioContext.state !== 'running') return;
+            if (isSpeaking || isAnalyzing) return;
+
+            if (!isManualTap && hasAnnouncedReady) return;
+
+            if (pendingCard && !pendingPosition) {
+                playAlert('number');
+                return;
+            }
+            if (pendingPosition && !pendingCard) {
+                playAlert('card');
+                return;
+            }
+
             if (alertBuffers.ready) {
-                setTimeout(() => playDecodedBuffer(alertBuffers.ready, false), 180);
+                hasAnnouncedReady = true;
+                triggerHaptic([70, 50, 70]);
+                debugEl.innerText = "Ready — Speak card and position";
+                playDecodedBuffer(alertBuffers.ready);
             }
         }
 
@@ -192,7 +179,6 @@
             if (audioStream) return; 
 
             try {
-                // Direct, uninterrupted microphone stream for maximum accuracy
                 audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
                 audioContext = new (window.AudioContext || window.webkitAudioContext)();
                 const sourceNode = audioContext.createMediaStreamSource(audioStream);
@@ -206,7 +192,8 @@
                 silentGain.connect(audioContext.destination);
 
                 processorNode.onaudioprocess = (e) => {
-                    if (isSpeaking || isAnalyzing) return;
+                    // Ignore mic while speaking, analyzing, or during post-speech echo cooldown
+                    if (isSpeaking || isAnalyzing || Date.now() < micCooldownUntil) return;
 
                     const inputData = e.inputBuffer.getChannelData(0);
                     const chunkCopy = new Float32Array(inputData);
@@ -217,44 +204,56 @@
                         if (abs > maxPeak) maxPeak = abs;
                     }
                     const displayLevel = Math.min(99, Math.round(maxPeak * 140));
-                    const SPEECH_THRESHOLD = 7;
+                    
+                    // Threshold 15 ignores quiet room hum & breathing
+                    const SPEECH_THRESHOLD = 15;
 
                     if (!isRecording) {
                         preRollChunks.push(chunkCopy);
                         if (preRollChunks.length > PRE_ROLL_MAX_CHUNKS) {
                             preRollChunks.shift();
                         }
-                        statusEl.innerText = `Listening... (${displayLevel})`;
-                        statusEl.style.color = "#a0a5b5";
+                        statusEl.innerText = `🟢 Ready & Listening (${displayLevel})`;
+                        statusEl.style.color = "#50fa7b";
+
+                        if (displayLevel > SPEECH_THRESHOLD) {
+                            consecutiveLoudChunks++;
+                            // Require 2 consecutive voice chunks (~90ms) so random clicks don't trigger recording
+                            if (consecutiveLoudChunks >= 2) {
+                                isRecording = true;
+                                activeSpeechChunksCount = consecutiveLoudChunks;
+                                recordedChunks = [...preRollChunks, chunkCopy];
+                                preRollChunks = [];
+                                statusEl.innerText = "🔴 Recording...";
+                                statusEl.style.color = "#ff5555";
+
+                                if (pendingTimer) clearTimeout(pendingTimer);
+
+                                maxRecordTimer = setTimeout(() => {
+                                    if (isRecording) finishRecordingAndTranscribe();
+                                }, 5000);
+
+                                clearTimeout(silenceTimer);
+                                silenceTimer = setTimeout(() => {
+                                    if (isRecording) finishRecordingAndTranscribe();
+                                }, 1150);
+                            }
+                        } else {
+                            consecutiveLoudChunks = 0;
+                        }
                     } else {
                         recordedChunks.push(chunkCopy);
-                    }
-
-                    if (displayLevel > SPEECH_THRESHOLD) {
-                        if (!isRecording) {
-                            isRecording = true;
-                            recordedChunks = [...preRollChunks, chunkCopy];
-                            preRollChunks = [];
-                            statusEl.innerText = "Recording...";
-                            statusEl.style.color = "#ff5555";
-
-                            if (pendingTimer) clearTimeout(pendingTimer);
-
-                            maxRecordTimer = setTimeout(() => {
+                        if (displayLevel > SPEECH_THRESHOLD) {
+                            activeSpeechChunksCount++;
+                            clearTimeout(silenceTimer);
+                            silenceTimer = setTimeout(() => {
                                 if (isRecording) finishRecordingAndTranscribe();
-                            }, 5000);
+                            }, 1150);
                         }
-
-                        clearTimeout(silenceTimer);
-                        // 1.15s pause window: fast, yet never cuts off natural pauses between Card and Position
-                        silenceTimer = setTimeout(() => {
-                            if (isRecording) finishRecordingAndTranscribe();
-                        }, 1150);
                     }
                 };
 
-                resetToListening(false);
-                announceReadyOnce();
+                resetToListening();
                 preloadAlerts();
 
                 clearInterval(keepWarmInterval);
@@ -273,7 +272,6 @@
             }
         }
 
-        // Crisp 16kHz anti-aliased WAV encoding (Whisper's native sample rate for 100% consonant clarity)
         function encodeWAV(chunks, inputSampleRate) {
             let totalLength = 0;
             for (const c of chunks) totalLength += c.length;
@@ -310,7 +308,6 @@
 
             let outOffset = 44;
             for (let i = 0; i < newLength; i++) {
-                // Boxcar averaging prevents high-frequency aliasing on "s", "f", and "th"
                 const start = Math.floor(i * ratio);
                 const end = Math.min(merged.length, Math.ceil((i + 1) * ratio));
                 let sum = 0;
@@ -338,20 +335,22 @@
             clearTimeout(silenceTimer);
             clearTimeout(maxRecordTimer);
             isRecording = false;
+            consecutiveLoudChunks = 0;
 
             const chunksToProcess = recordedChunks;
+            const speechFrames = activeSpeechChunksCount;
             recordedChunks = [];
+            activeSpeechChunksCount = 0;
 
-            if (chunksToProcess.length === 0) {
-                resetToListening(false);
+            // If it was just a brief cough or bump (< 4 loud frames), ignore silently without calling server
+            if (chunksToProcess.length === 0 || speechFrames < 4) {
+                resetToListening();
                 return;
             }
 
             isAnalyzing = true;
             statusEl.innerText = "Analyzing...";
             statusEl.style.color = "#ffb86c";
-
-            playEarcon('captured');
 
             try {
                 const sampleRate = audioContext ? audioContext.sampleRate : 44100;
@@ -372,7 +371,7 @@
 
                 if (data.error) {
                     debugEl.innerText = `Error: ${data.error}`;
-                    resetToListening(true);
+                    resetToListening();
                     return;
                 }
 
@@ -388,9 +387,10 @@
                     triggerHaptic([80, 40, 80]);
 
                     if (data.audio) {
-                        playBase64Audio(data.audio);
+                        // Speak the cut result, then whisper "Ready." when back in listening mode
+                        playBase64Audio(data.audio, true);
                     } else {
-                        resetToListening(true);
+                        resetToListening();
                     }
                     return;
                 }
@@ -399,7 +399,7 @@
             } catch (e) {
                 isAnalyzing = false;
                 debugEl.innerText = "Connection error.";
-                resetToListening(true);
+                resetToListening();
             }
         }
 
@@ -410,8 +410,8 @@
                     pendingCard = null;
                     pendingPosition = null;
                     previousTranscript = "";
-                    debugEl.innerText = "Timed out waiting for second part.";
-                    playAlert('repeat');
+                    debugEl.innerText = "Reset — Ready for card & position";
+                    playAlert('ready');
                 }
             }, 15000);
         }
@@ -420,10 +420,10 @@
             triggerHaptic([50]);
             const buffer = alertBuffers[type];
             if (buffer) {
-                playDecodedBuffer(buffer, true);
+                playDecodedBuffer(buffer);
             } else {
                 const fallbackMap = { repeat: "Repeat.", number: "Number.", card: "Card.", ready: "Ready." };
-                speakFallback(fallbackMap[type] || "Repeat.");
+                speakFallback(fallbackMap[type] || "Ready.");
             }
         }
 
@@ -434,6 +434,7 @@
                 previousTranscript = rawText;
             }
 
+            // Card heard first -> Whisper "Number."
             if (data.card && !data.position) {
                 pendingCard = data.card;
                 const formatted = data.card.replace(/\b\w/g, c => c.toUpperCase());
@@ -443,6 +444,7 @@
                 return;
             }
 
+            // Number heard first -> Whisper "Card."
             if (!data.card && data.position) {
                 pendingPosition = data.position;
                 debugEl.innerText = `Locked Position: ${data.position} — Say card...`;
@@ -451,56 +453,70 @@
                 return;
             }
 
+            // Partial card heard -> Whisper "Repeat."
             if (data.partialCardAttempt) {
                 debugEl.innerText = `Missed card value: "${rawText}"`;
                 playAlert('repeat');
                 return;
             }
 
+            // Normal patter / background chatter -> Stay 100% silent
             if (pendingCard) {
                 debugEl.innerText = `Locked: ${pendingCard.toUpperCase()} — Waiting for number...`;
             } else if (pendingPosition) {
                 debugEl.innerText = `Locked Position: ${pendingPosition} — Waiting for card...`;
             } else {
-                debugEl.innerText = `Ignored chatter: "${rawText}"`;
+                debugEl.innerText = "Ready — Speak card and position";
             }
-            resetToListening(false);
+            resetToListening();
         }
 
-        function playDecodedBuffer(decodedBuffer, playReadyBlipAfter = true) {
+        function playDecodedBuffer(decodedBuffer, announceReadyAfter = false) {
             if (!audioContext || !decodedBuffer) {
-                resetToListening(playReadyBlipAfter);
+                resetToListening();
                 return;
             }
             isSpeaking = true;
-            statusEl.innerText = "Speaking...";
+            statusEl.innerText = "🔊 Speaking...";
             statusEl.style.color = "#9d84ff";
 
             speechFailSafeTimeout = setTimeout(() => {
-                resetToListening(playReadyBlipAfter);
-            }, 6000);
+                resetToListening();
+            }, 6500);
 
             try {
                 const bufferSource = audioContext.createBufferSource();
                 bufferSource.buffer = decodedBuffer;
                 bufferSource.connect(audioContext.destination);
                 bufferSource.onended = () => {
-                    setTimeout(() => resetToListening(playReadyBlipAfter), 180);
+                    if (announceReadyAfter && alertBuffers.ready) {
+                        // Brief 600ms pause after reading the cut, then whisper "Ready."
+                        setTimeout(() => {
+                            if (alertBuffers.ready) {
+                                debugEl.innerText = "Ready — Speak card and position";
+                                playDecodedBuffer(alertBuffers.ready, false);
+                            } else {
+                                resetToListening();
+                            }
+                        }, 600);
+                    } else {
+                        resetToListening();
+                    }
                 };
                 bufferSource.start(0);
             } catch (e) {
-                resetToListening(playReadyBlipAfter);
+                resetToListening();
             }
         }
 
-        async function playBase64Audio(base64Audio) {
+        async function playBase64Audio(base64Audio, announceReadyAfter = false) {
             isSpeaking = true;
-            statusEl.innerText = "Speaking...";
+            statusEl.innerText = "🔊 Speaking...";
             statusEl.style.color = "#9d84ff";
 
             speechFailSafeTimeout = setTimeout(() => {
-                resetToListening(true);
-            }, 6500);
+                resetToListening();
+            }, 7500);
 
             try {
                 if (audioContext && audioContext.state !== 'running') {
@@ -508,12 +524,12 @@
                 }
                 const decodedBuffer = await decodeBase64ToBuffer(base64Audio);
                 if (decodedBuffer) {
-                    playDecodedBuffer(decodedBuffer, true);
+                    playDecodedBuffer(decodedBuffer, announceReadyAfter);
                 } else {
-                    resetToListening(true);
+                    resetToListening();
                 }
             } catch (e) {
-                resetToListening(true);
+                resetToListening();
             }
         }
 
@@ -525,25 +541,26 @@
                     body: JSON.stringify({ action: 'tts', text: text })
                 });
                 const data = await res.json();
-                if (data.audio) playBase64Audio(data.audio);
-                else resetToListening(true);
+                if (data.audio) playBase64Audio(data.audio, false);
+                else resetToListening();
             } catch (e) {
-                resetToListening(true);
+                resetToListening();
             }
         }
 
-        function resetToListening(emitBlip = false) {
+        function resetToListening() {
             isSpeaking = false;
             isAnalyzing = false;
+            consecutiveLoudChunks = 0;
+            preRollChunks = [];
+            // 500ms cooldown after speaking so the mic never records its own earpiece echo
+            micCooldownUntil = Date.now() + 500;
             clearTimeout(speechFailSafeTimeout);
             if (audioContext && audioContext.state !== 'running') {
                 audioContext.resume().catch(() => {});
             }
-            statusEl.innerText = "Listening...";
-            statusEl.style.color = "#a0a5b5";
-            if (emitBlip) {
-                playEarcon('listening');
-            }
+            statusEl.innerText = "🟢 Ready & Listening";
+            statusEl.style.color = "#50fa7b";
         }
 
         function stopListening() {
