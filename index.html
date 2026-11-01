@@ -24,8 +24,23 @@
         #status { font-size: 1.2rem; margin-top: 20px; color: #a0a5b5; transition: color 0.1s; }
         #debug { font-size: 0.9rem; margin-top: 10px; color: #777; font-style: italic; min-height: 24px; padding: 0 20px; }
         #result { font-size: 1.4rem; margin-top: 30px; font-weight: bold; color: #ffffff; padding: 20px; border-radius: 10px; background: #232533; display: none; width: 80%; }
+        #mode-toggle {
+            margin-top: 28px;
+            padding: 10px 18px;
+            border-radius: 20px;
+            border: 1px solid #3b3e52;
+            background: #181b28;
+            color: #a0a5b5;
+            font-size: 0.8rem;
+            font-weight: 600;
+            letter-spacing: 0.5px;
+        }
+        #mode-toggle.active {
+            border-color: #9d84ff;
+            color: #9d84ff;
+            background: rgba(157, 132, 255, 0.12);
+        }
         #app-content { display: flex; flex-direction: column; align-items: center; width: 100%; }
-        /* Hidden iOS 18+ Taptic Engine Switch */
         #haptic-wrap { position: absolute; opacity: 0; pointer-events: none; width: 1px; height: 1px; overflow: hidden; }
     </style>
 </head>
@@ -41,17 +56,23 @@
         <div id="status">Initializing...</div>
         <div id="debug">Speak card and position</div>
         <div id="result"></div>
+        <button id="mode-toggle" class="active">🕶️ META GLASSES MODE: ON</button>
     </div>
 
     <script>
         const statusEl = document.getElementById('status');
         const debugEl = document.getElementById('debug');
         const resultEl = document.getElementById('result');
+        const modeToggleBtn = document.getElementById('mode-toggle');
         const hapticLabel = document.getElementById('haptic-label');
+
+        // Meta Glasses Mode: prefers iPhone built-in mic & releases Bluetooth HFP lock during playback/reveal
+        let metaGlassesMode = true;
 
         let isSpeaking = false;
         let isAnalyzing = false;
         let isRecording = false;
+        let isMicReleasedForVideo = false;
         let hasAnnouncedReady = false;
         let speechFailSafeTimeout = null;
         let keepWarmInterval = null;
@@ -67,12 +88,10 @@
         const PRE_ROLL_MAX_CHUNKS = 6; 
         let utterancePeak = 0;
 
-        // Two-way memory
         let pendingCard = null;
         let pendingPosition = null;
         let pendingTimer = null;
 
-        // Pre-decoded AudioBuffers for 0ms pocket playback
         const alertBuffers = {
             ready: null,
             repeat: null,
@@ -80,7 +99,27 @@
             card: null
         };
 
-        // --- HAPTIC & COVERT EAR-CON SYNTHESIZER ---
+        modeToggleBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            metaGlassesMode = !metaGlassesMode;
+            modeToggleBtn.className = metaGlassesMode ? 'active' : '';
+            modeToggleBtn.innerText = metaGlassesMode
+                ? '🕶️ META GLASSES MODE: ON'
+                : '🕶️ META GLASSES MODE: OFF';
+            triggerHaptic([40]);
+            if (isMicReleasedForVideo) {
+                wakeMicFromVideoMode();
+            }
+        });
+
+        function setIOSAudioSession(type) {
+            try {
+                if (navigator.audioSession) {
+                    navigator.audioSession.type = type;
+                }
+            } catch (e) {}
+        }
+
         function triggerHaptic(pattern = [60]) {
             try {
                 if (navigator.vibrate) navigator.vibrate(pattern);
@@ -88,7 +127,6 @@
             } catch (e) {}
         }
 
-        // Plays instant synthesized tones directly into the Bluetooth earpiece
         function playEarcon(type) {
             if (!audioContext || audioContext.state !== 'running') return;
             try {
@@ -99,7 +137,6 @@
                 gain.connect(audioContext.destination);
 
                 if (type === 'ready') {
-                    // Crisp ascending double-chime (660Hz -> 880Hz)
                     osc.type = 'sine';
                     osc.frequency.setValueAtTime(660, now);
                     osc.frequency.setValueAtTime(880, now + 0.09);
@@ -108,7 +145,6 @@
                     osc.start(now);
                     osc.stop(now + 0.23);
                 } else if (type === 'listening') {
-                    // Subtle 45ms high blip when mic re-opens
                     osc.type = 'sine';
                     osc.frequency.setValueAtTime(784, now);
                     gain.gain.setValueAtTime(0.09, now);
@@ -116,7 +152,6 @@
                     osc.start(now);
                     osc.stop(now + 0.055);
                 } else if (type === 'captured') {
-                    // Soft 35ms low tick when recording cuts to Analyzing
                     osc.type = 'triangle';
                     osc.frequency.setValueAtTime(420, now);
                     gain.gain.setValueAtTime(0.12, now);
@@ -127,8 +162,13 @@
             } catch (e) {}
         }
 
-        function unlockAudioContext() {
+        function handleScreenOrRemoteWake(e) {
+            if (e && e.target === modeToggleBtn) return;
             triggerHaptic([40]);
+            if (isMicReleasedForVideo) {
+                wakeMicFromVideoMode();
+                return;
+            }
             if (!audioContext) return;
             if (audioContext.state !== 'running') {
                 audioContext.resume().then(() => {
@@ -138,9 +178,11 @@
                 announceReadyOnce();
             }
         }
-        document.body.addEventListener('touchstart', unlockAudioContext, { passive: true });
-        document.body.addEventListener('touchend', unlockAudioContext, { passive: true });
-        document.body.addEventListener('click', unlockAudioContext);
+        document.body.addEventListener('touchstart', handleScreenOrRemoteWake, { passive: true });
+        document.body.addEventListener('click', handleScreenOrRemoteWake);
+        window.addEventListener('keydown', () => {
+            if (isMicReleasedForVideo) wakeMicFromVideoMode();
+        });
 
         async function decodeBase64ToBuffer(base64) {
             if (!base64 || !audioContext) return null;
@@ -190,19 +232,72 @@
             triggerHaptic([70, 50, 70]);
             playEarcon('ready');
             if (alertBuffers.ready) {
-                setTimeout(() => playDecodedBuffer(alertBuffers.ready, false), 180);
+                setTimeout(() => playDecodedBuffer(alertBuffers.ready, false, false), 180);
             }
         }
 
-        async function startListening() {
+        // Attempts to bind to the built-in iPhone Microphone so Meta Glasses mic stays free
+        async function getPreferredAudioStream() {
+            setIOSAudioSession('play-and-record');
+            let stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+            if (metaGlassesMode && navigator.mediaDevices.enumerateDevices) {
+                try {
+                    const devices = await navigator.mediaDevices.enumerateDevices();
+                    const iphoneMic = devices.find(d =>
+                        d.kind === 'audioinput' &&
+                        /iphone|built-in|internal|bottom|front|back/i.test(d.label)
+                    );
+                    if (iphoneMic && iphoneMic.deviceId) {
+                        const currentTrack = stream.getAudioTracks()[0];
+                        if (!currentTrack || currentTrack.label !== iphoneMic.label) {
+                            const localStream = await navigator.mediaDevices.getUserMedia({
+                                audio: { deviceId: { exact: iphoneMic.deviceId } }
+                            });
+                            stream.getTracks().forEach(t => t.stop());
+                            stream = localStream;
+                        }
+                    }
+                } catch (e) {}
+            }
+            return stream;
+        }
+
+        // Releases the Bluetooth HFP mic lock so Meta Glasses can record video & play A2DP audio
+        function releaseMicHardwareLock() {
+            if (processorNode) {
+                try { processorNode.disconnect(); } catch (e) {}
+                processorNode = null;
+            }
+            if (audioStream) {
+                audioStream.getTracks().forEach(track => track.stop());
+                audioStream = null;
+            }
+            // Kick iOS out of Call Mode (HFP) back into Media Playback Mode (A2DP)
+            setIOSAudioSession('playback');
+            setIOSAudioSession('auto');
+        }
+
+        async function wakeMicFromVideoMode() {
+            isMicReleasedForVideo = false;
+            statusEl.innerText = "Re-arming mic...";
+            statusEl.style.color = "#ffb86c";
+            await startListening(true);
+        }
+
+        async function startListening(isRewake = false) {
             if (audioStream) return; 
 
             try {
-                audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                const sourceNode = audioContext.createMediaStreamSource(audioStream);
+                audioStream = await getPreferredAudioStream();
+                if (!audioContext || audioContext.state === 'closed') {
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                }
+                if (audioContext.state !== 'running') {
+                    await audioContext.resume().catch(() => {});
+                }
 
-                // 1024 frame size (~23ms resolution) for ultra-fast speech cutoff
+                const sourceNode = audioContext.createMediaStreamSource(audioStream);
                 processorNode = audioContext.createScriptProcessor(1024, 1, 1);
                 const silentGain = audioContext.createGain();
                 silentGain.gain.value = 0;
@@ -211,8 +306,13 @@
                 processorNode.connect(silentGain);
                 silentGain.connect(audioContext.destination);
 
+                const activeMicLabel = audioStream.getAudioTracks()[0]?.label || "Mic active";
+                if (!pendingCard && !pendingPosition) {
+                    debugEl.innerText = `Input: ${activeMicLabel}`;
+                }
+
                 processorNode.onaudioprocess = (e) => {
-                    if (isSpeaking || isAnalyzing) return;
+                    if (isSpeaking || isAnalyzing || isMicReleasedForVideo) return;
 
                     const inputData = e.inputBuffer.getChannelData(0);
                     const chunkCopy = new Float32Array(inputData);
@@ -258,7 +358,6 @@
                             utterancePeak = displayLevel;
                         }
 
-                        // Dynamic threshold: ignores room noise so silence timer doesn't hang
                         const dynamicContinueThreshold = Math.max(9, Math.min(18, Math.round(utterancePeak * 0.35)));
 
                         if (displayLevel > dynamicContinueThreshold) {
@@ -270,11 +369,12 @@
                     }
                 };
 
-                resetToListening(false);
-                announceReadyOnce();
-                preloadAlerts();
+                resetToListening(isRewake);
+                if (!isRewake) {
+                    announceReadyOnce();
+                    preloadAlerts();
+                }
 
-                // Keep Vercel serverless container warm while in pocket
                 clearInterval(keepWarmInterval);
                 keepWarmInterval = setInterval(() => {
                     if (!isAnalyzing && !isRecording) {
@@ -292,7 +392,6 @@
         }
 
         function encodeWAV(chunks, inputSampleRate) {
-            // Trim silent head & tail chunks so Whisper processes at maximum speed
             let startIdx = 0;
             while (startIdx < chunks.length - 4) {
                 const c = chunks[startIdx];
@@ -386,7 +485,6 @@
             statusEl.innerText = "Analyzing...";
             statusEl.style.color = "#ffb86c";
 
-            // Instant pocket audio cue that speech capture finished and analysis started
             playEarcon('captured');
 
             try {
@@ -421,8 +519,14 @@
                     resultEl.style.display = 'block';
                     triggerHaptic([80, 40, 80]);
 
+                    // Release Bluetooth HFP lock BEFORE playing TTS so Meta Glasses can record video & play audio cleanly
+                    if (metaGlassesMode) {
+                        isMicReleasedForVideo = true;
+                        releaseMicHardwareLock();
+                    }
+
                     if (data.audio) {
-                        playBase64Audio(data.audio);
+                        playBase64Audio(data.audio, metaGlassesMode);
                     } else {
                         resetToListening(true);
                     }
@@ -453,7 +557,7 @@
             triggerHaptic([50]);
             const buffer = alertBuffers[type];
             if (buffer) {
-                playDecodedBuffer(buffer, true);
+                playDecodedBuffer(buffer, true, false);
             } else {
                 const fallbackMap = { repeat: "Repeat.", number: "Number.", card: "Card.", ready: "Ready." };
                 speakFallback(fallbackMap[type] || "Repeat.");
@@ -496,9 +600,10 @@
             resetToListening(false);
         }
 
-        function playDecodedBuffer(decodedBuffer, playReadyBlipAfter = true) {
+        function playDecodedBuffer(decodedBuffer, playReadyBlipAfter = true, stayInVideoModeAfter = false) {
             if (!audioContext || !decodedBuffer) {
-                resetToListening(playReadyBlipAfter);
+                if (stayInVideoModeAfter) enterVideoReadyState();
+                else resetToListening(playReadyBlipAfter);
                 return;
             }
             isSpeaking = true;
@@ -506,29 +611,43 @@
             statusEl.style.color = "#9d84ff";
 
             speechFailSafeTimeout = setTimeout(() => {
-                resetToListening(playReadyBlipAfter);
-            }, 5000);
+                if (stayInVideoModeAfter) enterVideoReadyState();
+                else resetToListening(playReadyBlipAfter);
+            }, 5500);
 
             try {
                 const bufferSource = audioContext.createBufferSource();
                 bufferSource.buffer = decodedBuffer;
                 bufferSource.connect(audioContext.destination);
                 bufferSource.onended = () => {
-                    setTimeout(() => resetToListening(playReadyBlipAfter), 140);
+                    setTimeout(() => {
+                        if (stayInVideoModeAfter) enterVideoReadyState();
+                        else resetToListening(playReadyBlipAfter);
+                    }, 140);
                 };
                 bufferSource.start(0);
             } catch (e) {
-                resetToListening(playReadyBlipAfter);
+                if (stayInVideoModeAfter) enterVideoReadyState();
+                else resetToListening(playReadyBlipAfter);
             }
         }
 
-        async function playBase64Audio(base64Audio) {
+        function enterVideoReadyState() {
+            isSpeaking = false;
+            isAnalyzing = false;
+            clearTimeout(speechFailSafeTimeout);
+            statusEl.innerText = "🎥 Meta Video Ready (Tap to Listen)";
+            statusEl.style.color = "#50fa7b";
+        }
+
+        async function playBase64Audio(base64Audio, stayInVideoModeAfter = false) {
             isSpeaking = true;
             statusEl.innerText = "Speaking...";
             statusEl.style.color = "#9d84ff";
 
             speechFailSafeTimeout = setTimeout(() => {
-                resetToListening(true);
+                if (stayInVideoModeAfter) enterVideoReadyState();
+                else resetToListening(true);
             }, 6000);
 
             try {
@@ -537,12 +656,14 @@
                 }
                 const decodedBuffer = await decodeBase64ToBuffer(base64Audio);
                 if (decodedBuffer) {
-                    playDecodedBuffer(decodedBuffer, true);
+                    playDecodedBuffer(decodedBuffer, true, stayInVideoModeAfter);
                 } else {
-                    resetToListening(true);
+                    if (stayInVideoModeAfter) enterVideoReadyState();
+                    else resetToListening(true);
                 }
             } catch (e) {
-                resetToListening(true);
+                if (stayInVideoModeAfter) enterVideoReadyState();
+                else resetToListening(true);
             }
         }
 
@@ -554,7 +675,7 @@
                     body: JSON.stringify({ action: 'tts', text: text })
                 });
                 const data = await res.json();
-                if (data.audio) playBase64Audio(data.audio);
+                if (data.audio) playBase64Audio(data.audio, false);
                 else resetToListening(true);
             } catch (e) {
                 resetToListening(true);
@@ -581,14 +702,7 @@
             clearTimeout(speechFailSafeTimeout);
             clearTimeout(pendingTimer);
             clearInterval(keepWarmInterval);
-            if (processorNode) {
-                try { processorNode.disconnect(); } catch (e) {}
-                processorNode = null;
-            }
-            if (audioStream) {
-                audioStream.getTracks().forEach(track => track.stop());
-                audioStream = null;
-            }
+            releaseMicHardwareLock();
             if (audioContext) {
                 audioContext.close().catch(() => {});
                 audioContext = null;
@@ -596,17 +710,18 @@
             isRecording = false;
             isSpeaking = false;
             isAnalyzing = false;
+            isMicReleasedForVideo = false;
             hasAnnouncedReady = false;
             statusEl.innerText = "Paused";
         }
 
-        window.addEventListener('load', startListening);
+        window.addEventListener('load', () => startListening(false));
 
         document.addEventListener('visibilitychange', () => {
             if (document.hidden) {
                 stopListening();
             } else {
-                startListening();
+                startListening(false);
             }
         });
     </script>
