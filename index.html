@@ -36,9 +36,9 @@
             letter-spacing: 0.5px;
         }
         #mode-toggle.active {
-            border-color: #9d84ff;
-            color: #9d84ff;
-            background: rgba(157, 132, 255, 0.12);
+            border-color: #50fa7b;
+            color: #50fa7b;
+            background: rgba(80, 250, 123, 0.12);
         }
         #app-content { display: flex; flex-direction: column; align-items: center; width: 100%; }
         #haptic-wrap { position: absolute; opacity: 0; pointer-events: none; width: 1px; height: 1px; overflow: hidden; }
@@ -56,7 +56,7 @@
         <div id="status">Initializing...</div>
         <div id="debug">Speak card and position</div>
         <div id="result"></div>
-        <button id="mode-toggle" class="active">🕶️ META GLASSES MODE: ON</button>
+        <button id="mode-toggle" class="active">🎥 META SIMULTANEOUS REC: ON</button>
     </div>
 
     <script>
@@ -66,13 +66,12 @@
         const modeToggleBtn = document.getElementById('mode-toggle');
         const hapticLabel = document.getElementById('haptic-label');
 
-        // Meta Glasses Mode: prefers iPhone built-in mic & releases Bluetooth HFP lock during playback/reveal
-        let metaGlassesMode = true;
+        // Simultaneous Mode: Locks onto iPhone built-in mic (or covert earpiece) & never triggers Meta HFP call lock
+        let metaSimultaneousMode = true;
 
         let isSpeaking = false;
         let isAnalyzing = false;
         let isRecording = false;
-        let isMicReleasedForVideo = false;
         let hasAnnouncedReady = false;
         let speechFailSafeTimeout = null;
         let keepWarmInterval = null;
@@ -99,17 +98,16 @@
             card: null
         };
 
-        modeToggleBtn.addEventListener('click', (e) => {
+        modeToggleBtn.addEventListener('click', async (e) => {
             e.stopPropagation();
-            metaGlassesMode = !metaGlassesMode;
-            modeToggleBtn.className = metaGlassesMode ? 'active' : '';
-            modeToggleBtn.innerText = metaGlassesMode
-                ? '🕶️ META GLASSES MODE: ON'
-                : '🕶️ META GLASSES MODE: OFF';
+            metaSimultaneousMode = !metaSimultaneousMode;
+            modeToggleBtn.className = metaSimultaneousMode ? 'active' : '';
+            modeToggleBtn.innerText = metaSimultaneousMode
+                ? '🎥 META SIMULTANEOUS REC: ON'
+                : '🎥 META SIMULTANEOUS REC: OFF';
             triggerHaptic([40]);
-            if (isMicReleasedForVideo) {
-                wakeMicFromVideoMode();
-            }
+            stopListening();
+            await startListening(true);
         });
 
         function setIOSAudioSession(type) {
@@ -162,13 +160,9 @@
             } catch (e) {}
         }
 
-        function handleScreenOrRemoteWake(e) {
+        function unlockAudioContext(e) {
             if (e && e.target === modeToggleBtn) return;
             triggerHaptic([40]);
-            if (isMicReleasedForVideo) {
-                wakeMicFromVideoMode();
-                return;
-            }
             if (!audioContext) return;
             if (audioContext.state !== 'running') {
                 audioContext.resume().then(() => {
@@ -178,11 +172,8 @@
                 announceReadyOnce();
             }
         }
-        document.body.addEventListener('touchstart', handleScreenOrRemoteWake, { passive: true });
-        document.body.addEventListener('click', handleScreenOrRemoteWake);
-        window.addEventListener('keydown', () => {
-            if (isMicReleasedForVideo) wakeMicFromVideoMode();
-        });
+        document.body.addEventListener('touchstart', unlockAudioContext, { passive: true });
+        document.body.addEventListener('click', unlockAudioContext);
 
         async function decodeBase64ToBuffer(base64) {
             if (!base64 || !audioContext) return null;
@@ -232,64 +223,69 @@
             triggerHaptic([70, 50, 70]);
             playEarcon('ready');
             if (alertBuffers.ready) {
-                setTimeout(() => playDecodedBuffer(alertBuffers.ready, false, false), 180);
+                setTimeout(() => playDecodedBuffer(alertBuffers.ready, false), 180);
             }
         }
 
-        // Attempts to bind to the built-in iPhone Microphone so Meta Glasses mic stays free
-        async function getPreferredAudioStream() {
-            setIOSAudioSession('play-and-record');
+        // Acquires mic WITHOUT activating Ray-Ban Meta Bluetooth HFP Call Mode
+        async function getNonBlockingAudioStream() {
+            if (!metaSimultaneousMode) {
+                setIOSAudioSession('play-and-record');
+                return await navigator.mediaDevices.getUserMedia({ audio: true });
+            }
+
+            // 'auto' prevents iOS from forcing Bluetooth HFP Call Mode on the Meta glasses
+            setIOSAudioSession('auto');
+
+            const savedIphoneMicId = localStorage.getItem('acaan_iphone_mic_id');
+            if (savedIphoneMicId) {
+                try {
+                    return await navigator.mediaDevices.getUserMedia({
+                        audio: { deviceId: { exact: savedIphoneMicId } }
+                    });
+                } catch (e) {
+                    localStorage.removeItem('acaan_iphone_mic_id');
+                }
+            }
+
             let stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
-            if (metaGlassesMode && navigator.mediaDevices.enumerateDevices) {
+            if (navigator.mediaDevices.enumerateDevices) {
                 try {
                     const devices = await navigator.mediaDevices.enumerateDevices();
-                    const iphoneMic = devices.find(d =>
+                    // Prefer a covert earpiece if connected, otherwise lock onto built-in iPhone Microphone
+                    // and explicitly avoid Ray-Ban Meta's built-in HFP mic
+                    const nonMetaMic = devices.find(d =>
                         d.kind === 'audioinput' &&
-                        /iphone|built-in|internal|bottom|front|back/i.test(d.label)
+                        !/ray-ban|meta|rb\s*meta/i.test(d.label) &&
+                        /iphone|built-in|internal|bottom|front|back|airpod|earpiece|headset/i.test(d.label)
                     );
-                    if (iphoneMic && iphoneMic.deviceId) {
+
+                    if (nonMetaMic && nonMetaMic.deviceId) {
+                        localStorage.setItem('acaan_iphone_mic_id', nonMetaMic.deviceId);
                         const currentTrack = stream.getAudioTracks()[0];
-                        if (!currentTrack || currentTrack.label !== iphoneMic.label) {
-                            const localStream = await navigator.mediaDevices.getUserMedia({
-                                audio: { deviceId: { exact: iphoneMic.deviceId } }
+                        if (!currentTrack || currentTrack.label !== nonMetaMic.label) {
+                            const cleanStream = await navigator.mediaDevices.getUserMedia({
+                                audio: { deviceId: { exact: nonMetaMic.deviceId } }
                             });
                             stream.getTracks().forEach(t => t.stop());
-                            stream = localStream;
+                            stream = cleanStream;
                         }
                     }
                 } catch (e) {}
             }
-            return stream;
-        }
 
-        // Releases the Bluetooth HFP mic lock so Meta Glasses can record video & play A2DP audio
-        function releaseMicHardwareLock() {
-            if (processorNode) {
-                try { processorNode.disconnect(); } catch (e) {}
-                processorNode = null;
-            }
-            if (audioStream) {
-                audioStream.getTracks().forEach(track => track.stop());
-                audioStream = null;
-            }
-            // Kick iOS out of Call Mode (HFP) back into Media Playback Mode (A2DP)
+            // Reset session to auto so Meta glasses stay free to record video continuously
             setIOSAudioSession('playback');
             setIOSAudioSession('auto');
-        }
-
-        async function wakeMicFromVideoMode() {
-            isMicReleasedForVideo = false;
-            statusEl.innerText = "Re-arming mic...";
-            statusEl.style.color = "#ffb86c";
-            await startListening(true);
+            return stream;
         }
 
         async function startListening(isRewake = false) {
             if (audioStream) return; 
 
             try {
-                audioStream = await getPreferredAudioStream();
+                audioStream = await getNonBlockingAudioStream();
                 if (!audioContext || audioContext.state === 'closed') {
                     audioContext = new (window.AudioContext || window.webkitAudioContext)();
                 }
@@ -308,11 +304,11 @@
 
                 const activeMicLabel = audioStream.getAudioTracks()[0]?.label || "Mic active";
                 if (!pendingCard && !pendingPosition) {
-                    debugEl.innerText = `Input: ${activeMicLabel}`;
+                    debugEl.innerText = `Mic: ${activeMicLabel}`;
                 }
 
                 processorNode.onaudioprocess = (e) => {
-                    if (isSpeaking || isAnalyzing || isMicReleasedForVideo) return;
+                    if (isSpeaking || isAnalyzing) return;
 
                     const inputData = e.inputBuffer.getChannelData(0);
                     const chunkCopy = new Float32Array(inputData);
@@ -323,7 +319,7 @@
                         if (abs > maxPeak) maxPeak = abs;
                     }
                     const displayLevel = Math.min(99, Math.round(maxPeak * 140));
-                    const START_THRESHOLD = 9;
+                    const START_THRESHOLD = 8;
 
                     if (!isRecording) {
                         preRollChunks.push(chunkCopy);
@@ -358,7 +354,7 @@
                             utterancePeak = displayLevel;
                         }
 
-                        const dynamicContinueThreshold = Math.max(9, Math.min(18, Math.round(utterancePeak * 0.35)));
+                        const dynamicContinueThreshold = Math.max(8, Math.min(18, Math.round(utterancePeak * 0.35)));
 
                         if (displayLevel > dynamicContinueThreshold) {
                             clearTimeout(silenceTimer);
@@ -519,14 +515,8 @@
                     resultEl.style.display = 'block';
                     triggerHaptic([80, 40, 80]);
 
-                    // Release Bluetooth HFP lock BEFORE playing TTS so Meta Glasses can record video & play audio cleanly
-                    if (metaGlassesMode) {
-                        isMicReleasedForVideo = true;
-                        releaseMicHardwareLock();
-                    }
-
                     if (data.audio) {
-                        playBase64Audio(data.audio, metaGlassesMode);
+                        playBase64Audio(data.audio);
                     } else {
                         resetToListening(true);
                     }
@@ -557,7 +547,7 @@
             triggerHaptic([50]);
             const buffer = alertBuffers[type];
             if (buffer) {
-                playDecodedBuffer(buffer, true, false);
+                playDecodedBuffer(buffer, true);
             } else {
                 const fallbackMap = { repeat: "Repeat.", number: "Number.", card: "Card.", ready: "Ready." };
                 speakFallback(fallbackMap[type] || "Repeat.");
@@ -600,19 +590,22 @@
             resetToListening(false);
         }
 
-        function playDecodedBuffer(decodedBuffer, playReadyBlipAfter = true, stayInVideoModeAfter = false) {
+        function playDecodedBuffer(decodedBuffer, playReadyBlipAfter = true) {
             if (!audioContext || !decodedBuffer) {
-                if (stayInVideoModeAfter) enterVideoReadyState();
-                else resetToListening(playReadyBlipAfter);
+                resetToListening(playReadyBlipAfter);
                 return;
             }
             isSpeaking = true;
             statusEl.innerText = "Speaking...";
             statusEl.style.color = "#9d84ff";
 
+            // Temporarily route TTS over A2DP media playback so it never triggers HFP Call Mode
+            if (metaSimultaneousMode) {
+                setIOSAudioSession('playback');
+            }
+
             speechFailSafeTimeout = setTimeout(() => {
-                if (stayInVideoModeAfter) enterVideoReadyState();
-                else resetToListening(playReadyBlipAfter);
+                resetToListening(playReadyBlipAfter);
             }, 5500);
 
             try {
@@ -621,33 +614,22 @@
                 bufferSource.connect(audioContext.destination);
                 bufferSource.onended = () => {
                     setTimeout(() => {
-                        if (stayInVideoModeAfter) enterVideoReadyState();
-                        else resetToListening(playReadyBlipAfter);
-                    }, 140);
+                        resetToListening(playReadyBlipAfter);
+                    }, 160);
                 };
                 bufferSource.start(0);
             } catch (e) {
-                if (stayInVideoModeAfter) enterVideoReadyState();
-                else resetToListening(playReadyBlipAfter);
+                resetToListening(playReadyBlipAfter);
             }
         }
 
-        function enterVideoReadyState() {
-            isSpeaking = false;
-            isAnalyzing = false;
-            clearTimeout(speechFailSafeTimeout);
-            statusEl.innerText = "🎥 Meta Video Ready (Tap to Listen)";
-            statusEl.style.color = "#50fa7b";
-        }
-
-        async function playBase64Audio(base64Audio, stayInVideoModeAfter = false) {
+        async function playBase64Audio(base64Audio) {
             isSpeaking = true;
             statusEl.innerText = "Speaking...";
             statusEl.style.color = "#9d84ff";
 
             speechFailSafeTimeout = setTimeout(() => {
-                if (stayInVideoModeAfter) enterVideoReadyState();
-                else resetToListening(true);
+                resetToListening(true);
             }, 6000);
 
             try {
@@ -656,14 +638,12 @@
                 }
                 const decodedBuffer = await decodeBase64ToBuffer(base64Audio);
                 if (decodedBuffer) {
-                    playDecodedBuffer(decodedBuffer, true, stayInVideoModeAfter);
+                    playDecodedBuffer(decodedBuffer, true);
                 } else {
-                    if (stayInVideoModeAfter) enterVideoReadyState();
-                    else resetToListening(true);
+                    resetToListening(true);
                 }
             } catch (e) {
-                if (stayInVideoModeAfter) enterVideoReadyState();
-                else resetToListening(true);
+                resetToListening(true);
             }
         }
 
@@ -675,7 +655,7 @@
                     body: JSON.stringify({ action: 'tts', text: text })
                 });
                 const data = await res.json();
-                if (data.audio) playBase64Audio(data.audio, false);
+                if (data.audio) playBase64Audio(data.audio);
                 else resetToListening(true);
             } catch (e) {
                 resetToListening(true);
@@ -686,6 +666,9 @@
             isSpeaking = false;
             isAnalyzing = false;
             clearTimeout(speechFailSafeTimeout);
+            if (metaSimultaneousMode) {
+                setIOSAudioSession('auto');
+            }
             if (audioContext && audioContext.state !== 'running') {
                 audioContext.resume().catch(() => {});
             }
@@ -702,7 +685,14 @@
             clearTimeout(speechFailSafeTimeout);
             clearTimeout(pendingTimer);
             clearInterval(keepWarmInterval);
-            releaseMicHardwareLock();
+            if (processorNode) {
+                try { processorNode.disconnect(); } catch (e) {}
+                processorNode = null;
+            }
+            if (audioStream) {
+                audioStream.getTracks().forEach(track => track.stop());
+                audioStream = null;
+            }
             if (audioContext) {
                 audioContext.close().catch(() => {});
                 audioContext = null;
@@ -710,7 +700,6 @@
             isRecording = false;
             isSpeaking = false;
             isAnalyzing = false;
-            isMicReleasedForVideo = false;
             hasAnnouncedReady = false;
             statusEl.innerText = "Paused";
         }
